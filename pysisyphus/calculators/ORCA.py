@@ -1,5 +1,6 @@
 import glob
 import io
+import json
 from math import sqrt
 from pathlib import Path
 import os
@@ -13,6 +14,7 @@ import pyparsing as pp
 
 from pysisyphus.MOCoeffs import MOCoeffs
 from pysisyphus.calculators.OverlapCalculator import (
+    ExactCrossOverlapError,
     GroundStateContext,
     OverlapCalculator,
 )
@@ -569,6 +571,8 @@ class ORCA(OverlapCalculator):
         numfreq=False,
         json_dump=None,
         wavefunction_dump=True,
+        orca_2json=None,
+        orca_2mkl=None,
         **kwargs,
     ):
         """ORCA calculator.
@@ -601,6 +605,12 @@ class ORCA(OverlapCalculator):
         wavefunction_dump : bool, optional
             Whether to dump the wavefunction to BSON via orca_2json. The BSON can become
             very large in calculations comprising many basis functions.
+        orca_2json : str, optional
+            Explicit path or command name for the orca_2json utility. By default the
+            utility is resolved next to the configured ORCA executable, then on PATH.
+        orca_2mkl : str, optional
+            Explicit path or command name for the orca_2mkl utility. Resolution follows
+            the same rules as for orca_2json.
         """
         super().__init__(**kwargs)
 
@@ -616,6 +626,15 @@ class ORCA(OverlapCalculator):
             )
             wavefunction_dump = json_dump
         self.wavefunction_dump = bool(wavefunction_dump)
+        self.orca_utility_overrides = {
+            "orca_2json": orca_2json,
+            "orca_2mkl": orca_2mkl,
+        }
+        if self.exact_cross_overlap and not self.wavefunction_dump:
+            raise ValueError(
+                "ORCA exact cross-geometry overlaps require 'wavefunction_dump: True' "
+                "so AO shell data can be exported by orca_2json."
+            )
 
         assert ("pal" not in keywords) and ("nprocs" not in blocks), (
             "PALn/nprocs not allowed! Use 'pal: n' in the 'calc' section instead."
@@ -646,18 +665,29 @@ class ORCA(OverlapCalculator):
             self.es_block_header = self.es_block_header[0]
 
         if self.do_tddft:
+            iroot_pattern = r"\biroot(?!mult)\s*(?:=\s*)?(\d+)"
+            iroot_matches = re.findall(iroot_pattern, self.blocks, re.IGNORECASE)
+            if len(iroot_matches) > 1:
+                raise ValueError(
+                    "The ORCA TDDFT/CIS block contains multiple IRoot directives."
+                )
             try:
-                self.root = int(re.search(r"iroot\s*(\d+)", self.blocks).group(1))
+                self.root = int(iroot_matches[0])
                 warnings.warn(
                     f"Using root {self.root}, as specified w/ 'iroot' keyword. Please "
                     "use the designated 'root' keyword in the future, as the 'iroot' route "
                     "will be deprecated.",
                     DeprecationWarning,
                 )
-            except AttributeError:
+            except IndexError:
                 self.log("Doing TDA/TDDFT calculation without gradient.")
         self.triplets = bool(
-            re.search(r"triplets\s+true|irootmult\s+triplet", self.blocks)
+            re.search(
+                r"\btriplets\s*(?:=\s*)?true\b|"
+                r"\birootmult\s*(?:=\s*)?triplet\b",
+                self.blocks,
+                re.IGNORECASE,
+            )
         )
         self.inp_fn = "orca.inp"
         self.out_fn = "orca.out"
@@ -665,7 +695,9 @@ class ORCA(OverlapCalculator):
             # *inp will match the input file and cipsi.inp in ICE-CI calculations
             "*inp",
             f"out:{self.out_fn}",
-            "gbw",
+            # ORCA 6 TDDFT also writes orca.TDDFTGuess.gbw. Match only the main
+            # checkpoint; the previous broad '*gbw' pattern made keep() abort.
+            "gbw:orca.gbw",
             "engrad",
             "hessian",
             "cis",
@@ -703,6 +735,71 @@ class ORCA(OverlapCalculator):
         }
 
         self.base_cmd = self.get_cmd()
+
+    @staticmethod
+    def _resolve_executable(candidate):
+        """Resolve an executable path/command name, returning None when unavailable."""
+
+        if candidate is None:
+            return None
+        candidate = os.path.expandvars(os.path.expanduser(os.fspath(candidate)))
+        if os.path.dirname(candidate):
+            path = Path(candidate).resolve()
+            if path.is_file() and os.access(path, os.X_OK):
+                return str(path)
+            return None
+        return shutil.which(candidate)
+
+    def resolve_orca_utility(self, utility):
+        """Resolve an ORCA companion utility with an explicit, local-first policy."""
+
+        if utility not in self.orca_utility_overrides:
+            raise ValueError(f"Unknown ORCA utility '{utility}'.")
+
+        override = self.orca_utility_overrides[utility]
+        if override is not None:
+            resolved = self._resolve_executable(override)
+            if resolved is None:
+                raise FileNotFoundError(
+                    f"Configured {utility} executable '{override}' was not found or is "
+                    "not executable."
+                )
+            self.log(f"Using explicitly configured {utility}: {resolved}")
+            return resolved
+
+        # A configured ORCA path should select utilities from the same installation,
+        # which prevents accidental ORCA-version mixing when several releases are on PATH.
+        base_cmd = self.base_cmd[0] if isinstance(self.base_cmd, (tuple, list)) else self.base_cmd
+        orca_exe = self._resolve_executable(base_cmd)
+        if orca_exe is not None:
+            sibling = Path(orca_exe).with_name(utility)
+            resolved = self._resolve_executable(sibling)
+            if resolved is not None:
+                self.log(f"Resolved {utility} beside configured ORCA: {resolved}")
+                return resolved
+
+        resolved = self._resolve_executable(utility)
+        if resolved is not None:
+            self.log(f"Resolved {utility} on PATH: {resolved}")
+            return resolved
+        raise FileNotFoundError(
+            f"Could not find {utility} beside the configured ORCA executable or on "
+            f"PATH. Set the ORCA calculator option '{utility}' explicitly."
+        )
+
+    def get_orca_utility_command(self, utility, *args):
+        return [self.resolve_orca_utility(utility), *map(os.fspath, args)]
+
+    @staticmethod
+    def write_orca_2json_config(path):
+        """Write a minimal ORCA 5/6 wavefunction-export configuration."""
+
+        config = {
+            "MOCoefficients": True,
+            "Basisset": True,
+            "JSONFormats": ["bson"],
+        }
+        Path(path).write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
     def reattach(self, last_calc_cycle):
         # Use the latest .gbw
@@ -753,19 +850,63 @@ class ORCA(OverlapCalculator):
         block_str = self.blocks
         # Use the correct iroot if 'root' attribute is set.
         if self.root is not None:
-            # The spaces around ' iroot ' are important, because w/o them this conditional
-            # would also evaluate to True for 'irootmult', which is not intended.
-            if " iroot " in self.blocks:
+            # Match both ``IRoot 2`` and ``IRoot=2`` without confusing
+            # ``IRootMult``. Multiple directives are ambiguous and must not be
+            # papered over by inserting a third value.
+            iroot_pattern = r"\biroot(?!mult)\s*(?:=\s*)?\d+"
+            iroot_matches = re.findall(
+                iroot_pattern, self.blocks, flags=re.IGNORECASE
+            )
+            if len(iroot_matches) > 1:
+                raise ValueError(
+                    "The ORCA TDDFT/CIS block contains multiple IRoot directives."
+                )
+            if iroot_matches:
                 block_str = re.sub(
-                    r" iroot\s+(\d+)", f" iroot {self.root}", self.blocks
+                    iroot_pattern,
+                    f"iroot {self.root}",
+                    self.blocks,
+                    count=1,
+                    flags=re.IGNORECASE,
                 )
             # Insert appropriate iroot keyword if not already present
             else:
                 block_str = re.sub(
                     f"{self.es_block_header}",
                     f"{self.es_block_header} iroot {self.root}",
-                    self.blocks,
+                    block_str,
                 )
+            if self.triplets:
+                irootmult_pattern = (
+                    r"\birootmult\s*(?:=\s*)?(singlet|triplet)\b"
+                )
+                irootmult_matches = re.findall(
+                    irootmult_pattern, block_str, flags=re.IGNORECASE
+                )
+                if len(irootmult_matches) > 1:
+                    raise ValueError(
+                        "The ORCA TDDFT/CIS block contains multiple IRootMult directives."
+                    )
+                if irootmult_matches:
+                    if irootmult_matches[0].lower() != "triplet":
+                        raise ValueError(
+                            "Triplet root selection conflicts with IRootMult singlet."
+                        )
+                    block_str = re.sub(
+                        irootmult_pattern,
+                        "irootmult triplet",
+                        block_str,
+                        count=1,
+                        flags=re.IGNORECASE,
+                    )
+                else:
+                    block_str = re.sub(
+                        re.escape(self.es_block_header),
+                        f"{self.es_block_header} irootmult triplet",
+                        block_str,
+                        count=1,
+                        flags=re.IGNORECASE,
+                    )
             self.log(f"Using iroot '{self.root}' for excited state gradient.")
         return block_str
 
@@ -920,16 +1061,32 @@ class ORCA(OverlapCalculator):
     def run_after(self, path):
         # Create .molden file when CDDs are requested
         if self.cdds:
-            cmd = "orca_2mkl orca -molden"
+            cmd = self.get_orca_utility_command("orca_2mkl", "orca", "-molden")
             self.popen(cmd, cwd=path)
             shutil.copy(path / "orca.molden.input", path / "orca.molden")
 
         if self.wavefunction_dump:
             # Will silently fail with ECPs
-            cmd = "orca_2json orca -bson"
+            self.write_orca_2json_config(path / "orca.json.conf")
+            # ORCA 6 requires the .gbw suffix; passing only the basename fails.
+            cmd = self.get_orca_utility_command(
+                "orca_2json", "orca.gbw", "-bson"
+            )
             proc = self.popen(cmd, cwd=path)
             if (ret := proc.returncode) != 0:
-                self.log(f"orca_2json call failed with return-code {ret}!")
+                msg = f"orca_2json call failed with return-code {ret}!"
+                self.log(msg)
+                if self.exact_cross_overlap:
+                    raise ExactCrossOverlapError(
+                        msg
+                        + " Exact cross-geometry AO overlaps require a valid ORCA "
+                        "BSON wavefunction export."
+                    )
+            elif self.exact_cross_overlap and not (path / "orca.bson").is_file():
+                raise ExactCrossOverlapError(
+                    "orca_2json returned successfully but did not create 'orca.bson'; "
+                    "exact cross-geometry AO overlaps are unavailable."
+                )
 
     @staticmethod
     @file_or_str(".hess", method=False)
@@ -1144,17 +1301,69 @@ class ORCA(OverlapCalculator):
         if triplets is None:
             triplets = self.triplets
         # Parse eigenvectors from tda/tddft calculation
-        Xa, Ya, Xb, Yb = parse_orca_cis(self.cis, restricted_same_ab=True)
-        if triplets:
-            Xa = Xa[self.nroots :]
-            Ya = Ya[self.nroots :]
-            Xb = Xb[self.nroots :]
-            Yb = Yb[self.nroots :]
-        mo_coeffs = parse_orca_gbw(self.gbw)
-        Ca = mo_coeffs.Ca
-        Cb = mo_coeffs.Cb
+        # parse_orca_cis already selects the triplet half when triplets_only=True.
+        # Slicing by nroots a second time discarded the requested triplet roots.
+        Xa, Ya, Xb, Yb = parse_orca_cis(
+            self.cis,
+            restricted_same_ab=True,
+            triplets_only=triplets,
+        )
+        if self.exact_cross_overlap:
+            # ORCA 6 changed the binary GBW layout.  The exact backend already
+            # requires a BSON export, so obtain coefficients and AO ordering from
+            # that versioned/exported representation and avoid the legacy raw-GBW
+            # parser entirely.
+            wavefunction = self._load_overlap_wavefunction()
+            self._prepared_overlap_wavefunction = wavefunction
+            Ca, Cb = wavefunction.C
+        else:
+            # Preserve the historical path and numerical behavior unless the exact
+            # backend was explicitly requested.
+            mo_coeffs = parse_orca_gbw(self.gbw)
+            Ca = mo_coeffs.Ca
+            Cb = mo_coeffs.Cb
         all_energies = self.parse_all_energies()
         return Ca, Xa, Ya, Cb, Xb, Yb, all_energies
+
+    def _load_overlap_wavefunction(self):
+        """Load and parse the latest retained ORCA BSON wavefunction."""
+
+        try:
+            bson = Path(self.bson)
+        except (AttributeError, TypeError) as err:
+            raise ExactCrossOverlapError(
+                "Exact cross-geometry AO overlaps were requested, but no ORCA BSON "
+                "wavefunction was retained. Check the orca_2json output."
+            ) from err
+        if not bson.is_file():
+            raise ExactCrossOverlapError(
+                "Exact cross-geometry AO overlaps were requested, but the retained "
+                f"ORCA BSON wavefunction does not exist: '{bson}'."
+            )
+        try:
+            return self.load_wavefunction_from_file(bson)
+        except Exception as err:
+            raise ExactCrossOverlapError(
+                f"Failed to parse ORCA wavefunction snapshot '{bson}' ({err})."
+            ) from err
+
+    def prepare_overlap_wavefunction(self, path=None):
+        """Return the ORCA JSON/BSON snapshot used for exact AO cross-overlaps."""
+
+        if not self.exact_cross_overlap:
+            raise ExactCrossOverlapError(
+                "ORCA wavefunction snapshots are parsed for state tracking only when "
+                "'exact_cross_overlap: True' is enabled."
+            )
+        try:
+            wavefunction = self._prepared_overlap_wavefunction
+        except AttributeError:
+            wavefunction = self._load_overlap_wavefunction()
+        else:
+            # The cache exists only to share one parse between prepare_overlap_data
+            # and store_overlap_data in the same calculation.
+            del self._prepared_overlap_wavefunction
+        return wavefunction
 
     def get_chkfiles(self):
         return {

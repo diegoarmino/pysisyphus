@@ -35,6 +35,15 @@ class StabilizedQNMethod(Optimizer):
         self.bio = bio
         self.trust_radius = trust_radius
         self.linesearch = linesearch
+        if self.step_controller is not None:
+            if self.bio or self.linesearch:
+                self.log(
+                    "Disabling SQNM bond-stretch pre-application and implicit "
+                    "line search because transactional state-aware step control "
+                    "must survey the first geometry mutation."
+                )
+            self.bio = False
+            self.linesearch = False
 
         self.log(
             f"Keeping at most information from {self.hist_max} " "previous cycles."

@@ -61,6 +61,15 @@ class RFOptimizer(HessianOptimizer):
         self.line_search = line_search
         self.gediis = gediis
         self.gdiis = gdiis
+        if self.step_controller is not None:
+            if any((self.line_search, self.gediis, self.gdiis)):
+                self.log(
+                    "Disabling implicit line search, GEDIIS and GDIIS because "
+                    "transactional state-aware step control is active."
+                )
+            self.line_search = False
+            self.gediis = False
+            self.gdiis = False
         self.gdiis_thresh = gdiis_thresh  # Will be compared to rms(step)
         self.gediis_thresh = gediis_thresh  # Will be compared to rms(forces)
         self.gdiis_test_direction = gdiis_test_direction
@@ -71,6 +80,7 @@ class RFOptimizer(HessianOptimizer):
         self.successful_line_search = 0
 
     def get_step(self, energy, forces, hessian, eigvals, eigvecs, resetted):
+        self._step_prediction_context = None
         gradient = -forces
         step_func, pred_func = self.get_step_func(eigvals, gradient)
 
@@ -80,7 +90,7 @@ class RFOptimizer(HessianOptimizer):
 
         # Right everything is in place to check for convergence.  If all values are below
         # the thresholds, there is no need to do additional inter/extrapolations.
-        if self.check_convergence(ref_step)[0]:  # Drop conv_info
+        if self.check_convergence(ref_step, record=False)[0]:  # Drop conv_info
             self.log("Convergence achieved! Skipping inter/extrapolation.")
             return ref_step
 
@@ -162,8 +172,24 @@ class RFOptimizer(HessianOptimizer):
         # Use the original, actually calculated, gradient
         prediction = pred_func(ref_gradient, hessian, step)
         self.predicted_energy_changes.append(prediction)
+        self._step_prediction_context = (pred_func, ref_gradient.copy(), hessian.copy())
 
         return step
+
+    def on_step_control(self, original_step, controlled_step):
+        """Keep the trust-model prediction consistent with a scaled proposal."""
+
+        if np.allclose(original_step, controlled_step):
+            return
+        try:
+            pred_func, gradient, hessian = self._step_prediction_context
+            self.predicted_energy_changes[-1] = pred_func(
+                gradient, hessian, controlled_step
+            )
+        except (AttributeError, IndexError, TypeError):
+            # A convergence-shortcut step has no prediction and will not be used
+            # to update the trust radius in a subsequent cycle.
+            return
 
     def postprocess_opt(self):
         msg = (

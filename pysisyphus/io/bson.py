@@ -5,6 +5,9 @@ import io
 import struct
 
 
+_END_DOCUMENT = object()
+
+
 def expect(expt, handle, fmt, size):
     data = struct.unpack(fmt, handle.read(size))
     assert data == expt
@@ -47,7 +50,7 @@ def parse_element(handle, data, size):
     kind = struct.unpack("<b", handle.read(1))[0]
     # Return early when end of object is encountered
     if kind == 0x0:
-        return
+        return _END_DOCUMENT
 
     ename = read_ename(handle)
 
@@ -66,6 +69,9 @@ def parse_element(handle, data, size):
         parse_document(handle, value, size)
         # Drop integer keys and convert to list
         value = [value[str(i)] for i in range(len(value))]
+    # Null (present in ORCA 6.1 BSON exports)
+    elif kind == 0xA:
+        value = None
     elif kind == 0x10:
         value = read_int32(handle)
     else:
@@ -77,7 +83,7 @@ def parse_element(handle, data, size):
 
 def parse_document(handle, data, size=None):
     size = read_int32(handle)
-    while parse_element(handle, data, size) is not None:
+    while parse_element(handle, data, size) is not _END_DOCUMENT:
         pass
 
 

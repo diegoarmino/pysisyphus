@@ -36,6 +36,50 @@ from pysisyphus.wavefunction.excited_states import (
 )
 
 
+class ExactCrossOverlapError(RuntimeError):
+    """Raised when an exact cross-geometry AO overlap cannot be constructed."""
+
+
+def _atom_labels(atoms):
+    return tuple(str(atom).strip().lower() for atom in atoms)
+
+
+def normalize_tden_overlap_matrix(overlaps, ref_self_overlaps, cur_self_overlaps):
+    """Normalize transition-density overlaps by the two self-overlaps.
+
+    The normalization is applied state by state,
+
+    ``O_ij / sqrt(O_ii(ref, ref) * O_jj(cur, cur))``.
+
+    Unlike a row/column Euclidean normalization this retains the transition-density
+    metric used to form the overlap matrix.  Invalid or vanishing self-overlaps are
+    rejected instead of silently producing NaNs or arbitrary assignments.
+    """
+
+    overlaps = np.asarray(overlaps)
+    ref_norms = np.real_if_close(np.diag(ref_self_overlaps))
+    cur_norms = np.real_if_close(np.diag(cur_self_overlaps))
+    if np.iscomplexobj(ref_norms) or np.iscomplexobj(cur_norms):
+        raise ValueError("Transition-density self-overlaps must be real.")
+    if (not np.isfinite(ref_norms).all()) or (not np.isfinite(cur_norms).all()):
+        raise ValueError("Transition-density self-overlaps must be finite.")
+
+    eps = np.finfo(float).eps * 100
+    if (ref_norms <= eps).any() or (cur_norms <= eps).any():
+        raise ValueError(
+            "Cannot normalize transition-density overlaps: encountered a "
+            "non-positive or vanishing self-overlap."
+        )
+
+    denominators = np.sqrt(np.outer(ref_norms, cur_norms))
+    if overlaps.shape != denominators.shape:
+        raise ValueError(
+            "Transition-density overlap and normalization shapes differ: "
+            f"{overlaps.shape} != {denominators.shape}."
+        )
+    return overlaps / denominators
+
+
 @dataclasses.dataclass
 class StateNTOs:
     holes: np.ndarray
@@ -390,6 +434,9 @@ class OverlapCalculator(Calculator):
         mos_ref="cur",
         mos_renorm: bool = True,
         min_cost: bool = False,
+        exact_cross_overlap: bool = False,
+        exact_cross_overlap_atol: float = 1e-6,
+        normalize_tden: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -406,6 +453,16 @@ class OverlapCalculator(Calculator):
             self.ovlp_type in self.OVLP_TYPE_VERBOSE.keys()
         ), f"Valid overlap types are {self.VALID_KEYS}"
         self.double_mol = double_mol
+        self.exact_cross_overlap = bool(exact_cross_overlap)
+        if self.exact_cross_overlap and self.double_mol:
+            raise ValueError(
+                "'exact_cross_overlap' and 'double_mol' are alternative AO-overlap "
+                "backends and cannot both be enabled."
+            )
+        self.exact_cross_overlap_atol = float(exact_cross_overlap_atol)
+        if self.exact_cross_overlap_atol <= 0.0:
+            raise ValueError("'exact_cross_overlap_atol' must be positive.")
+        self.normalize_tden = bool(normalize_tden)
         assert ovlp_with in ("previous", "first", "adapt")
         self.ovlp_with = ovlp_with
         assert (self.ovlp_type, self.ovlp_with) != (
@@ -457,6 +514,10 @@ class OverlapCalculator(Calculator):
         self.Ya_list = list()
         self.Xb_list = list()
         self.Yb_list = list()
+        # Full Wavefunction objects are deliberately retained only for the optional
+        # exact cross-geometry AO-overlap backend.  They can be sizeable for large
+        # calculations, so the legacy/default path leaves this list empty.
+        self.overlap_wavefunctions = list()
 
         self.wfow = None
         # self.ntosa_list = list()
@@ -547,12 +608,14 @@ class OverlapCalculator(Calculator):
             == len(self.Xb_list)
             == len(self.Yb_list)
         )
+        if self.exact_cross_overlap:
+            assert len(self.overlap_wavefunctions) == len(self.Xa_list)
         return len(self.Xa_list)
 
     def clear_stored_calculations(self):
         for lst in (
-            self.ntosa_list,
-            self.ntosb_list,
+            self.ntos,
+            self.overlap_wavefunctions,
             self.coords_list,
             self.calculated_roots,
             self.roots_list,
@@ -588,7 +651,244 @@ class OverlapCalculator(Calculator):
         like mos, a MO coefficient array and a CI coefficient array."""
         raise Exception("Implement me!")
 
-    def store_overlap_data(self, atoms, coords, path=None, overlap_data=None):
+    def prepare_overlap_wavefunction(self, path=None):
+        """Return the Wavefunction snapshot for the latest calculation.
+
+        Calculators that support ``exact_cross_overlap`` must override this method.
+        Keeping it separate from ``prepare_overlap_data`` makes the expensive full
+        wavefunction parsing strictly opt-in.
+        """
+
+        raise ExactCrossOverlapError(
+            "Exact cross-geometry AO overlaps were requested, but calculator "
+            f"'{type(self).__name__}' does not provide a wavefunction snapshot."
+        )
+
+    def _validate_overlap_wavefunction(self, wavefunction, atoms, coords, Ca, Cb):
+        """Validate one wavefunction snapshot against its tracking data."""
+
+        prefix = "Invalid wavefunction snapshot for exact cross-geometry overlap: "
+        atol = self.exact_cross_overlap_atol
+
+        if wavefunction is None:
+            raise ExactCrossOverlapError(prefix + "got None.")
+        if not getattr(wavefunction, "has_shells", False):
+            raise ExactCrossOverlapError(prefix + "no AO shell data are present.")
+        if _atom_labels(wavefunction.atoms) != _atom_labels(atoms):
+            raise ExactCrossOverlapError(
+                prefix
+                + "atom identities/order differ between the optimizer and wavefunction "
+                f"({_atom_labels(atoms)} != {_atom_labels(wavefunction.atoms)})."
+            )
+
+        coords = np.asarray(coords, dtype=float).reshape(-1)
+        wf_coords = np.asarray(wavefunction.coords, dtype=float).reshape(-1)
+        if coords.shape != wf_coords.shape or not np.allclose(
+            coords, wf_coords, atol=atol, rtol=0.0
+        ):
+            max_diff = (
+                np.inf
+                if coords.shape != wf_coords.shape
+                else np.max(np.abs(coords - wf_coords))
+            )
+            raise ExactCrossOverlapError(
+                prefix
+                + "coordinates differ between the optimizer and wavefunction "
+                f"(maximum absolute difference {max_diff:.3e} bohr)."
+            )
+
+        Ca = np.asarray(Ca)
+        Cb = np.asarray(Cb)
+        if Ca.ndim != 2 or Cb.ndim != 2:
+            raise ExactCrossOverlapError(prefix + "MO coefficients are not matrices.")
+        if not np.isfinite(Ca).all() or not np.isfinite(Cb).all():
+            raise ExactCrossOverlapError(prefix + "MO coefficients contain NaN/Inf.")
+
+        try:
+            S_self = np.asarray(wavefunction.S)
+        except Exception as err:
+            raise ExactCrossOverlapError(
+                prefix + f"failed to calculate the same-geometry AO overlap ({err})."
+            ) from err
+        nbf = Ca.shape[0]
+        expected_shape = (nbf, nbf)
+        if Cb.shape[0] != nbf or S_self.shape != expected_shape:
+            raise ExactCrossOverlapError(
+                prefix
+                + "incompatible AO dimensions: "
+                f"Ca={Ca.shape}, Cb={Cb.shape}, S_AO={S_self.shape}."
+            )
+        if not np.isfinite(S_self).all():
+            raise ExactCrossOverlapError(prefix + "AO overlap contains NaN/Inf.")
+        self_transpose_error = np.max(np.abs(S_self - S_self.T))
+        if self_transpose_error > atol:
+            raise ExactCrossOverlapError(
+                prefix
+                + "same-geometry AO overlap is not symmetric "
+                f"(maximum error {self_transpose_error:.3e})."
+            )
+
+        wf_coords3d = wf_coords.reshape(-1, 3)
+        for shell_ind, shell in enumerate(wavefunction.shells.shells):
+            center_ind = shell.center_ind
+            if not (0 <= center_ind < len(wf_coords3d)):
+                raise ExactCrossOverlapError(
+                    prefix
+                    + f"basis shell {shell_ind} refers to invalid center {center_ind}."
+                )
+            if not np.allclose(
+                shell.center, wf_coords3d[center_ind], atol=atol, rtol=0.0
+            ):
+                raise ExactCrossOverlapError(
+                    prefix
+                    + f"basis shell {shell_ind} is not centered on atom {center_ind}."
+                )
+
+        for spin, C in (("alpha", Ca), ("beta", Cb)):
+            metric = C.T @ S_self @ C
+            ident = np.eye(C.shape[1])
+            error = np.max(np.abs(metric - ident))
+            if error > atol:
+                raise ExactCrossOverlapError(
+                    prefix
+                    + f"{spin} MOs are not orthonormal in the exported AO basis "
+                    f"(maximum |C^T S C - I| = {error:.3e}, tolerance {atol:.3e})."
+                )
+
+        # Verify that the MOs parsed for tracking use the same AO ordering as the
+        # ORCA JSON/BSON snapshot.  Orbital signs are arbitrary, hence abs().
+        wf_coeffs = np.asarray(wavefunction.C)
+        if wf_coeffs.ndim != 3 or wf_coeffs.shape[0] != 2:
+            raise ExactCrossOverlapError(
+                prefix + f"unexpected wavefunction MO shape {wf_coeffs.shape}."
+            )
+        for spin, C, C_wf in (
+            ("alpha", Ca, wf_coeffs[0]),
+            ("beta", Cb, wf_coeffs[1]),
+        ):
+            if C.shape != C_wf.shape:
+                raise ExactCrossOverlapError(
+                    prefix
+                    + f"{spin} MO shapes differ between tracking data and wavefunction "
+                    f"({C.shape} != {C_wf.shape})."
+                )
+            mo_match = np.abs(C.T @ S_self @ C_wf)
+            match_error = np.max(np.abs(mo_match - np.eye(C.shape[1])))
+            if match_error > atol:
+                raise ExactCrossOverlapError(
+                    prefix
+                    + f"{spin} MOs do not match the exported wavefunction ordering "
+                    f"(maximum error {match_error:.3e}, tolerance {atol:.3e})."
+                )
+
+    def _validate_cross_overlap_pair(self, wf_ref, wf_cur, Ca_ref, Ca_cur):
+        """Validate atom/basis compatibility of two wavefunction snapshots."""
+
+        prefix = "Cannot calculate exact cross-geometry AO overlap: "
+        atol = self.exact_cross_overlap_atol
+        if _atom_labels(wf_ref.atoms) != _atom_labels(wf_cur.atoms):
+            raise ExactCrossOverlapError(prefix + "atom identities/order changed.")
+        if wf_ref.bf_type != wf_cur.bf_type:
+            raise ExactCrossOverlapError(
+                prefix + f"basis-function types differ ({wf_ref.bf_type} != {wf_cur.bf_type})."
+            )
+        if wf_ref.shells.ordering != wf_cur.shells.ordering:
+            raise ExactCrossOverlapError(
+                prefix
+                + "AO orderings differ "
+                f"({wf_ref.shells.ordering} != {wf_cur.shells.ordering})."
+            )
+
+        shells_ref = wf_ref.shells.shells
+        shells_cur = wf_cur.shells.shells
+        if len(shells_ref) != len(shells_cur):
+            raise ExactCrossOverlapError(
+                prefix
+                + f"number of shells changed ({len(shells_ref)} != {len(shells_cur)})."
+            )
+        for shell_ind, (shell_ref, shell_cur) in enumerate(zip(shells_ref, shells_cur)):
+            discrete_ref = (
+                shell_ref.center_ind,
+                shell_ref.atomic_num,
+                shell_ref.L,
+            )
+            discrete_cur = (
+                shell_cur.center_ind,
+                shell_cur.atomic_num,
+                shell_cur.L,
+            )
+            arrays_match = (
+                shell_ref.exps.shape == shell_cur.exps.shape
+                and shell_ref.coeffs_org.shape == shell_cur.coeffs_org.shape
+                and np.allclose(shell_ref.exps, shell_cur.exps, atol=atol, rtol=1e-12)
+                and np.allclose(
+                    shell_ref.coeffs_org,
+                    shell_cur.coeffs_org,
+                    atol=atol,
+                    rtol=1e-12,
+                )
+            )
+            if (discrete_ref != discrete_cur) or (not arrays_match):
+                raise ExactCrossOverlapError(
+                    prefix + f"basis shell {shell_ind} changed between geometries."
+                )
+
+        if not np.array_equal(wf_ref.ecp_electrons, wf_cur.ecp_electrons):
+            raise ExactCrossOverlapError(prefix + "ECP electron counts changed.")
+
+        expected_shape = (Ca_ref.shape[0], Ca_cur.shape[0])
+        try:
+            S_cross = np.asarray(wf_ref.S_with(wf_cur))
+            S_reverse = np.asarray(wf_cur.S_with(wf_ref))
+        except Exception as err:
+            raise ExactCrossOverlapError(
+                prefix + f"analytic AO integral evaluation failed ({err})."
+            ) from err
+        if S_cross.shape != expected_shape:
+            raise ExactCrossOverlapError(
+                prefix
+                + f"cross-overlap shape {S_cross.shape} does not match MO AO dimensions "
+                f"{expected_shape}."
+            )
+        if S_reverse.shape != expected_shape[::-1]:
+            raise ExactCrossOverlapError(
+                prefix + f"reverse cross-overlap has invalid shape {S_reverse.shape}."
+            )
+        if not np.isfinite(S_cross).all() or not np.isfinite(S_reverse).all():
+            raise ExactCrossOverlapError(prefix + "cross-overlap contains NaN/Inf.")
+        transpose_error = np.max(np.abs(S_cross - S_reverse.T))
+        if transpose_error > atol:
+            raise ExactCrossOverlapError(
+                prefix
+                + "forward/reverse cross-overlaps are inconsistent "
+                f"(maximum transpose error {transpose_error:.3e}, tolerance {atol:.3e})."
+            )
+        return S_cross
+
+    def get_exact_cross_overlap(self, indices=None):
+        """Return exact analytic ``<AO(ref)|AO(cur)>`` for two stored cycles."""
+
+        if not self.exact_cross_overlap:
+            raise ExactCrossOverlapError(
+                "Exact cross-geometry AO overlap is disabled. Set "
+                "'exact_cross_overlap: True' to enable it."
+            )
+        ref, cur = self.get_indices(indices)
+        try:
+            wf_ref = self.overlap_wavefunctions[ref]
+            wf_cur = self.overlap_wavefunctions[cur]
+            Ca_ref = self.Ca_list[ref]
+            Ca_cur = self.Ca_list[cur]
+        except IndexError as err:
+            raise ExactCrossOverlapError(
+                "Exact cross-geometry AO overlap was requested, but one or both "
+                "wavefunction snapshots are unavailable."
+            ) from err
+        return self._validate_cross_overlap_pair(wf_ref, wf_cur, Ca_ref, Ca_cur)
+
+    def store_overlap_data(
+        self, atoms, coords, path=None, overlap_data=None, wavefunction=None
+    ):
         if self.atoms is None:
             self.atoms = atoms
 
@@ -609,6 +909,11 @@ class OverlapCalculator(Calculator):
         assert Ca.ndim == Cb.ndim == 2
         assert all([mat.ndim == 3 for mat in (Xa, Ya, Xb, Yb)])
 
+        if self.exact_cross_overlap:
+            if wavefunction is None:
+                wavefunction = self.prepare_overlap_wavefunction(path)
+            self._validate_overlap_wavefunction(wavefunction, atoms, coords, Ca, Cb)
+
         Xa, Ya, Xb, Yb = norm_ci_coeffs(Xa, Ya, Xb, Yb)
         self.Ca_list.append(Ca.copy())
         self.Cb_list.append(Cb.copy())
@@ -616,6 +921,8 @@ class OverlapCalculator(Calculator):
         self.Ya_list.append(Ya)
         self.Xb_list.append(Xb)
         self.Yb_list.append(Yb)
+        if self.exact_cross_overlap:
+            self.overlap_wavefunctions.append(wavefunction)
 
         # If WF-overlaps were requested we initialize the WFOWrapper object
         if (self.ovlp_type == "wf") and (self.wfow is None):
@@ -728,14 +1035,29 @@ class OverlapCalculator(Calculator):
         elif self.mos_renorm and (not reconstruct_S_AO):
             self.log("Skipped MO re-normalization as 'S_AO' was provided.")
 
-        norms_0a = self.get_mo_norms(Cs[0][0], S_AO)
-        norms_0b = self.get_mo_norms(Cs[0][1], S_AO)
-        norms_1a = self.get_mo_norms(Cs[1][0], S_AO)
-        norms_1b = self.get_mo_norms(Cs[1][1], S_AO)
-        self.log(f"norm(MOs_0a): {describe(norms_0a)}")
-        self.log(f"norm(MOs_0b): {describe(norms_0b)}")
-        self.log(f"norm(MOs_1a): {describe(norms_1a)}")
-        self.log(f"norm(MOs_1b): {describe(norms_1b)}")
+        if reconstruct_S_AO:
+            norms_0a = self.get_mo_norms(Cs[0][0], S_AO)
+            norms_0b = self.get_mo_norms(Cs[0][1], S_AO)
+            norms_1a = self.get_mo_norms(Cs[1][0], S_AO)
+            norms_1b = self.get_mo_norms(Cs[1][1], S_AO)
+            self.log(f"norm(MOs_0a): {describe(norms_0a)}")
+            self.log(f"norm(MOs_0b): {describe(norms_0b)}")
+            self.log(f"norm(MOs_1a): {describe(norms_1a)}")
+            self.log(f"norm(MOs_1b): {describe(norms_1b)}")
+        else:
+            # A cross-geometry matrix is not a self metric.  Expressions such as
+            # C_ref.T @ S_ref,cur @ C_ref therefore are not MO norms, even when both
+            # AO spaces happen to have the same dimension.
+            expected_shape = (Ca_ref.shape[0], Ca_cur.shape[0])
+            if S_AO.shape != expected_shape:
+                raise ValueError(
+                    f"Cross-geometry AO-overlap shape {S_AO.shape} does not match "
+                    f"MO AO dimensions {expected_shape}."
+                )
+            self.log(
+                "Using supplied cross-geometry S_AO "
+                f"with shape {S_AO.shape} and max(abs(S_AO))={np.abs(S_AO).max():.6f}."
+            )
         return *Cs[0], *Cs[1], S_AO
 
     @staticmethod
@@ -783,7 +1105,7 @@ class OverlapCalculator(Calculator):
         # Current step
         Xa_cur, Ya_cur, Xb_cur, Yb_cur = self.get_ci_coeffs_for(cur)
 
-        return get_tden_overlaps(
+        overlaps = get_tden_overlaps(
             Ca_ref,
             Cb_ref,
             Xa_ref,
@@ -798,6 +1120,61 @@ class OverlapCalculator(Calculator):
             Yb_cur,
             S_AO,
         )
+        if not self.normalize_tden:
+            return overlaps
+
+        if self.exact_cross_overlap:
+            ref, cur = self.get_indices(indices)
+            try:
+                S_ref = self.overlap_wavefunctions[ref].S
+                S_cur = self.overlap_wavefunctions[cur].S
+            except IndexError as err:
+                raise ExactCrossOverlapError(
+                    "Normalized transition-density overlaps requested exact self "
+                    "metrics, but a wavefunction snapshot is unavailable."
+                ) from err
+        else:
+            # Legacy calculations do not retain AO shell data.  Construct separate
+            # self metrics at the two geometries rather than using the cross matrix
+            # (which is not a valid self metric).
+            S_ref = self.get_sao_from_mo_coeffs(Ca_ref)
+            S_cur = self.get_sao_from_mo_coeffs(Ca_cur)
+
+        ref_self_overlaps = get_tden_overlaps(
+            Ca_ref,
+            Cb_ref,
+            Xa_ref,
+            Ya_ref,
+            Xb_ref,
+            Yb_ref,
+            Ca_ref,
+            Cb_ref,
+            Xa_ref,
+            Ya_ref,
+            Xb_ref,
+            Yb_ref,
+            S_ref,
+        )
+        cur_self_overlaps = get_tden_overlaps(
+            Ca_cur,
+            Cb_cur,
+            Xa_cur,
+            Ya_cur,
+            Xb_cur,
+            Yb_cur,
+            Ca_cur,
+            Cb_cur,
+            Xa_cur,
+            Ya_cur,
+            Xb_cur,
+            Yb_cur,
+            S_cur,
+        )
+        normalized = normalize_tden_overlap_matrix(
+            overlaps, ref_self_overlaps, cur_self_overlaps
+        )
+        self.log("Normalized transition-density overlaps by state self-overlaps.")
+        return normalized
 
     def get_nto_overlaps(self, indices=None, S_AO=None, org=False):
         *_, S_AO = self.get_orbital_matrices(indices, S_AO)
@@ -979,9 +1356,13 @@ class OverlapCalculator(Calculator):
             return False
 
         S_AO = None
-        # We can only run a double molecule calculation if it is
-        # implemented for the specific calculator.
-        if self.double_mol and hasattr(self, "run_double_mol_calculation"):
+        if self.exact_cross_overlap:
+            S_AO = self.get_exact_cross_overlap()
+            self.log("Calculated exact analytic cross-geometry AO overlaps.")
+        # We can only run a double molecule calculation if it is implemented for
+        # the specific calculator.  Keep the historical fallback behavior for this
+        # older option; exact_cross_overlap, in contrast, always fails loudly.
+        elif self.double_mol and hasattr(self, "run_double_mol_calculation"):
             old, new = self.get_indices()
             two_coords = self.coords_list[old], self.coords_list[new]
             S_AO = self.run_double_mol_calculation(self.atoms, *two_coords)

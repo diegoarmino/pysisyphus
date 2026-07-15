@@ -42,7 +42,12 @@ def shells_from_json_dict(data, **kwargs):
     for atom in atoms:
         center = np.array(atom["Coords"]) * coord_factor
         center_ind = atom["Idx"]
-        bfs = atom["BasisFunctions"]
+        # ORCA <= 5 used "BasisFunctions" whereas ORCA 6.1 exports the same
+        # per-center shell records under "Basis".
+        try:
+            bfs = atom["BasisFunctions"]
+        except KeyError:
+            bfs = atom["Basis"]
         atomic_num = atom["ElementNumber"]
         for bf in bfs:
             exps = np.array(bf["Exponents"])

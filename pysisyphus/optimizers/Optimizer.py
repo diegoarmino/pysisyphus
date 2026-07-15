@@ -180,6 +180,7 @@ class Optimizer(metaclass=abc.ABCMeta):
         h5_fn: str = "optimization.h5",
         h5_group_name: str = "opt",
         image_opt_kwargs: Optional[dict] = None,
+        step_controller=None,
         logging_level: int = logging.INFO,
     ) -> None:
         """Optimizer baseclass. Meant to be subclassed.
@@ -282,6 +283,11 @@ class Optimizer(metaclass=abc.ABCMeta):
             Optimizer kwargs that are used to construct child-optimizers. Currently
             only used to obtain TS-optimizers in COS-optimizations to converge an
             image to an actual TS.
+        step_controller
+            Optional transactional step controller. A mapping constructs the
+            built-in state-aware controller; custom objects must implement
+            ``select_step(optimizer, step)``. Trial points selected by a controller
+            are surveyed before the proposed step enters optimizer history.
         logging_level
             Controls logging level of TablePrinter. Setting it to logging.DEBUG will
             suppress printing to STDOUT and writing to pysisyphus.log. Messages will
@@ -319,11 +325,31 @@ class Optimizer(metaclass=abc.ABCMeta):
         if image_opt_kwargs is None:
             image_opt_kwargs = dict()
         self.image_opt_kwargs = image_opt_kwargs
+        from pysisyphus.optimizers.step_control import make_step_controller
+
+        self.step_controller = make_step_controller(step_controller)
+        self.step_control_results = list()
+        self._state_step_transaction_open = False
+        self._state_step_rollback_coords = None
+        self._state_step_rollback_cart_coords = None
+        self._state_step_tracking_revision = None
         self.logging_level = logging_level
 
         self.logger = logging.getLogger(f"pysis.{self.prefix}opt")
         configure_opt_logger(self.logger, self.prefix)
         self.is_cos = issubclass(type(self.geometry), ChainOfStates)
+        if self.step_controller is not None:
+            if self.is_cos:
+                raise ValueError(
+                    "Transactional state-aware step control currently supports "
+                    "single-geometry optimizations only, not ChainOfStates objects."
+                )
+            if self.reparam_when == "after":
+                self.log(
+                    "Disabling post-step reparametrization because it could change "
+                    "an electronically surveyed geometry."
+                )
+                self.reparam_when = None
 
         # Set up convergence thresholds
         self.convergence = self.make_conv_dict(
@@ -427,6 +453,167 @@ class Optimizer(metaclass=abc.ABCMeta):
             header, col_fmts, width=12, logger=self.logger, level=self.logging_level
         )
         self.is_converged = False
+
+    def apply_step_controller(self, step):
+        """Apply the optional proposal/survey/stage hook to an optimizer step."""
+
+        if self.step_controller is None:
+            return step
+        original = np.asarray(step, dtype=float)
+        rollback_coords = np.asarray(self.geometry.coords, dtype=float).copy()
+        rollback_cart_coords = np.asarray(
+            self.geometry.cart_coords, dtype=float
+        ).copy()
+        try:
+            result = self.step_controller.select_step(self, original)
+        except BaseException:
+            try:
+                self.geometry.calculator.discard_staged_state_survey()
+            except AttributeError:
+                pass
+            raise
+        self._state_step_transaction_open = True
+        self._state_step_rollback_coords = rollback_coords
+        self._state_step_rollback_cart_coords = rollback_cart_coords
+        self._state_step_tracking_revision = getattr(
+            self.geometry.calculator, "tracking_revision", None
+        )
+        controlled = np.asarray(result.step, dtype=float)
+        if controlled.shape != original.shape:
+            raise ValueError(
+                "Step controller returned an incompatible shape: "
+                f"{controlled.shape}, expected {original.shape}."
+            )
+        if not np.all(np.isfinite(controlled)):
+            raise ValueError("Step controller returned non-finite coordinates.")
+        try:
+            self.step_control_results.append(result)
+            self.on_step_control(original, controlled)
+            self.log(
+                "State-aware step controller selected "
+                f"lambda={result.selected.factor:g}, root={result.selected.root}, "
+                f"status={result.selected.status.value}."
+            )
+        except BaseException:
+            self.rollback_uncommitted_state_step()
+            raise
+        return controlled
+
+    def apply_step_controller_unless_converged(self, step):
+        """Avoid probing a new state when the current geometry is converged."""
+
+        if self.step_controller is None:
+            return step
+        converged, _ = self.check_convergence(step=step, record=False)
+        state_convergence = getattr(
+            self.geometry.calculator, "state_convergence_ok", None
+        )
+        if converged and callable(state_convergence):
+            converged = bool(state_convergence())
+        if converged:
+            self.log(
+                "Current geometry already satisfies convergence; skipping the "
+                "unneeded electronic-state trial survey."
+            )
+            return step
+        return self.apply_step_controller(step)
+
+    def on_step_control(self, original_step, controlled_step):
+        """Subclass hook for updating model quantities after step scaling."""
+
+        return
+
+    def rollback_uncommitted_state_step(self):
+        """Return to the last gradient-evaluated geometry before stopping.
+
+        A controlled endpoint is only electronically committed when the next
+        force evaluation succeeds.  Operator stops and cycle exhaustion occur
+        after pysisyphus has applied the geometric step but before that force
+        call, so writing the trial as a final geometry would misrepresent it as
+        an evaluated state.
+        """
+
+        if self.step_controller is None:
+            return
+        calculator = self.geometry.calculator
+        transaction_open = bool(
+            getattr(self, "_state_step_transaction_open", False)
+        )
+        has_stage = bool(getattr(calculator, "has_staged_state_survey", False))
+        if not transaction_open and not has_stage:
+            return
+        start_revision = getattr(self, "_state_step_tracking_revision", None)
+        current_revision = getattr(calculator, "tracking_revision", None)
+        if (
+            transaction_open
+            and start_revision is not None
+            and current_revision is not None
+            and current_revision != start_revision
+        ):
+            # The selected-root force call already committed electronically.
+            # Reverting only the geometry would create a mismatched snapshot.
+            self._state_step_transaction_open = False
+            self._state_step_rollback_coords = None
+            self._state_step_rollback_cart_coords = None
+            self._state_step_tracking_revision = None
+            self.log(
+                "The electronic state step was already committed; retaining its "
+                "geometry while propagating the later optimizer error."
+            )
+            return
+        try:
+            calculator.discard_staged_state_survey()
+        except AttributeError:
+            pass
+        rollback_cart = getattr(self, "_state_step_rollback_cart_coords", None)
+        rollback_coords = getattr(self, "_state_step_rollback_coords", None)
+        if rollback_cart is not None and callable(
+            getattr(self.geometry, "set_coords", None)
+        ):
+            self.geometry.cart_coords = np.asarray(rollback_cart, dtype=float).copy()
+        elif rollback_coords is not None:
+            self.geometry.coords = np.asarray(rollback_coords, dtype=float).copy()
+        elif self.coords:
+            # Compatibility fallback for custom controllers/optimizers that
+            # staged state before the explicit transaction marker existed.
+            self.geometry.coords = np.asarray(self.coords[-1], dtype=float).copy()
+        self._state_step_transaction_open = False
+        self._state_step_rollback_coords = None
+        self._state_step_rollback_cart_coords = None
+        self._state_step_tracking_revision = None
+        self.log(
+            "Discarded the unevaluated staged state endpoint and restored the "
+            "last gradient-evaluated geometry."
+        )
+
+    def complete_state_step_transaction(self):
+        """Close a staged step after its selected-root gradient committed."""
+
+        if self.step_controller is None or not bool(
+            getattr(self, "_state_step_transaction_open", False)
+        ):
+            return
+        calculator = self.geometry.calculator
+        if bool(getattr(calculator, "has_staged_state_survey", False)):
+            raise RuntimeError(
+                "The force evaluation returned without committing the staged "
+                "electronic-state survey."
+            )
+        start_revision = getattr(self, "_state_step_tracking_revision", None)
+        current_revision = getattr(calculator, "tracking_revision", None)
+        if (
+            start_revision is not None
+            and current_revision is not None
+            and current_revision == start_revision
+        ):
+            raise RuntimeError(
+                "The staged force evaluation cleared its survey without advancing "
+                "the committed electronic-state revision."
+            )
+        self._state_step_transaction_open = False
+        self._state_step_rollback_coords = None
+        self._state_step_rollback_cart_coords = None
+        self._state_step_tracking_revision = None
 
     def get_path_for_fn(self, fn, with_prefix=True):
         prefix = self.prefix if with_prefix else ""
@@ -546,7 +733,14 @@ class Optimizer(metaclass=abc.ABCMeta):
         """
         self.logger.log(self.logging_level, message)
 
-    def check_convergence(self, step=None, multiple=1.0, overachieve_factor=None):
+    def check_convergence(
+        self,
+        step=None,
+        multiple=1.0,
+        overachieve_factor=None,
+        *,
+        record=True,
+    ):
         """Check if the current convergence of the optimization
         is equal to or below the required thresholds, or a multiple
         thereof. The latter may be used in initiating the climbing image.
@@ -587,10 +781,11 @@ class Optimizer(metaclass=abc.ABCMeta):
         max_force = np.abs(forces).max()
         max_step = np.abs(step).max()
 
-        self.max_forces.append(max_force)
-        self.rms_forces.append(rms_force)
-        self.max_steps.append(max_step)
-        self.rms_steps.append(rms_step)
+        if record:
+            self.max_forces.append(max_force)
+            self.rms_forces.append(rms_force)
+            self.max_steps.append(max_step)
+            self.rms_steps.append(rms_step)
 
         # Give geometry a chance to signal convergence, e.g. GrowingNT that
         # is supposed to stop when a TS was passed.
@@ -939,6 +1134,23 @@ class Optimizer(metaclass=abc.ABCMeta):
         return textwrap.dedent(final_summary.strip())
 
     def get_run_generator(self):
+        """Run optimization cycles and roll back an uncommitted state endpoint.
+
+        A transactional controller stages its electronic decision before the
+        geometry is changed, while commitment happens only when the next force
+        evaluation succeeds.  Any exception (including ``ZeroStepLength``),
+        caller cancellation, or output/restart failure in between must therefore
+        discard the pending survey and restore the last gradient-evaluated
+        geometry.
+        """
+
+        try:
+            yield from self._get_run_generator_impl()
+        except BaseException:
+            self.rollback_uncommitted_state_step()
+            raise
+
+    def _get_run_generator_impl(self):
         self.print("If not specified otherwise, all quantities are given in au.\n")
 
         if not self.restarted:
@@ -1032,6 +1244,10 @@ class Optimizer(metaclass=abc.ABCMeta):
             #########################################
 
             get_step_kwargs = self.housekeeping()
+            # If this geometry was staged in the previous cycle, housekeeping
+            # has now completed its selected-root force call and the calculator
+            # must have committed the electronic snapshot.
+            self.complete_state_step_transaction()
 
             # After the call to self.housekeeping() we have up-to-date energies and
             # forces, which we'll pass to self.geometry.prepare_opt_cycle. There,
@@ -1053,6 +1269,17 @@ class Optimizer(metaclass=abc.ABCMeta):
             #####################################################################
 
             step = self.get_step(**get_step_kwargs)
+
+            if step is None:
+                # Remove the previously added coords
+                self.coords.pop(-1)
+                self.cart_coords.pop(-1)
+                continue
+
+            # This is the proposal/survey boundary. A transactional controller
+            # may replace the proposed step, but rejected trials never enter the
+            # optimizer's coordinate, force, Hessian or secant history.
+            step = self.apply_step_controller_unless_converged(step)
 
             try:
                 ts_image_indices = self.geometry.get_ts_image_indices()
@@ -1078,12 +1305,6 @@ class Optimizer(metaclass=abc.ABCMeta):
                 except AttributeError:
                     pass
 
-            if step is None:
-                # Remove the previously added coords
-                self.coords.pop(-1)
-                self.cart_coords.pop(-1)
-                continue
-
             if self.is_cos:
                 self.tangents.append(self.geometry.tangents.flatten())
 
@@ -1092,6 +1313,17 @@ class Optimizer(metaclass=abc.ABCMeta):
             # A check for convergence is done before the step applied. That is
             # energies & forces should still be set on the Geometry object.
             self.is_converged, conv_info = self.check_convergence()
+            state_convergence = getattr(
+                self.geometry.calculator, "state_convergence_ok", None
+            )
+            if self.is_converged and callable(state_convergence):
+                state_ok = bool(state_convergence())
+                if not state_ok:
+                    self.log(
+                        "Geometric convergence was reached, but the electronic "
+                        "state-tracking confidence gate rejected convergence."
+                    )
+                self.is_converged = self.is_converged and state_ok
 
             end_time = time.time()
             elapsed_seconds = end_time - start_time
@@ -1120,6 +1352,7 @@ class Optimizer(metaclass=abc.ABCMeta):
                         handle.write(asciiart)
 
             if self.is_converged:
+                self.rollback_uncommitted_state_step()
                 self.table.print("Converged!")
                 break
             # Allow convergence, before checking for too small steps
@@ -1137,7 +1370,12 @@ class Optimizer(metaclass=abc.ABCMeta):
                 # when internal coordinates are used, as the internal-Cartesian
                 # transformation is done iteratively.
                 self.steps[-1] = self.geometry.coords - self.coords[-1]
+                if self.step_controller is not None:
+                    self.step_controller.validate_applied_geometry(
+                        self.geometry.cart_coords
+                    )
             except RebuiltInternalsException as exception:
+                self.rollback_uncommitted_state_step()
                 self.print("Rebuilt internal coordinates!")
                 rebuilt_fn = self.get_path_for_fn("rebuilt_primitives.xyz")
                 with open(rebuilt_fn, "w") as handle:
@@ -1185,6 +1423,7 @@ class Optimizer(metaclass=abc.ABCMeta):
                 self.log(f"rms of coordinates after reparametrization={rms:.6f}")
                 self.is_converged = rms < self.reparam_thresh
                 if self.is_converged:
+                    self.rollback_uncommitted_state_step()
                     self.table.print(
                         "Insignificant coordinate change after "
                         "reparametrization. Signalling convergence!"
@@ -1202,6 +1441,7 @@ class Optimizer(metaclass=abc.ABCMeta):
                     if interfrag_dist > prev_interfrag_dist:
                         self.print("Interfragment distances increased!")
                         self.stopped = True  # Can't use := in if clause
+                        self.rollback_uncommitted_state_step()
                         break
                 except IndexError:
                     pass
@@ -1212,15 +1452,18 @@ class Optimizer(metaclass=abc.ABCMeta):
             sign = check_for_end_sign()
             if sign == "stop":
                 self.stopped = True
+                self.rollback_uncommitted_state_step()
                 break
             elif sign == "converged":
                 self.converged = True
+                self.rollback_uncommitted_state_step()
                 self.table.print("Operator indicated convergence!")
                 break
 
             self.log("")
             yield self.cur_cycle
         else:
+            self.rollback_uncommitted_state_step()
             self.table.print("Number of cycles exceeded!")
 
         #############################################
@@ -1279,6 +1522,10 @@ class Optimizer(metaclass=abc.ABCMeta):
             "forces": [forces.tolist() for forces in self.forces],
             "steps": [step.tolist() for step in self.steps],
         }
+        if self.step_controller is not None:
+            get_controller_info = getattr(self.step_controller, "get_restart_info", None)
+            if callable(get_controller_info):
+                restart_info["step_controller_info"] = get_controller_info()
         restart_info.update(self._get_opt_restart_info())
         return restart_info
 
@@ -1299,6 +1546,11 @@ class Optimizer(metaclass=abc.ABCMeta):
         self.energies = restart_info["energies"]
         self.forces = [np.array(forces) for forces in restart_info["forces"]]
         self.steps = [np.array(step) for step in restart_info["steps"]]
+
+        if self.step_controller is not None:
+            set_controller_info = getattr(self.step_controller, "set_restart_info", None)
+            if callable(set_controller_info):
+                set_controller_info(restart_info.get("step_controller_info"))
 
         # Set subclass specific information
         self._set_opt_restart_info(restart_info)

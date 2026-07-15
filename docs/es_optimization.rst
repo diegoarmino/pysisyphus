@@ -97,6 +97,22 @@ below.
      #
      # Possible values: (True, False)
      double_mol: False
+     # Use analytic cross-geometry AO integrals from two retained wavefunction
+     # snapshots. This is currently implemented for ORCA JSON/BSON exports. Unlike
+     # the default reconstruction, it evaluates <AO(ref)|AO(cur)> with the basis
+     # functions centered at their actual geometries. It is mutually exclusive with
+     # double_mol and deliberately remains opt-in for backwards compatibility.
+     # Invalid/missing wavefunction exports, changed atom ordering or basis sets, and
+     # inconsistent MO/AO ordering cause the calculation to stop.
+     # ORCA's orca_2json utility is resolved next to the configured ORCA executable
+     # to avoid mixing installations. It can be overridden explicitly with, e.g.,
+     # orca_2json: /opt/orca_6_1_1/orca_2json (and similarly for orca_2mkl).
+     #
+     # Possible values: (True, False)
+     exact_cross_overlap: False
+     # Absolute tolerance used for basis, transpose-symmetry, coordinate and MO
+     # orthonormality checks in the exact backend.
+     exact_cross_overlap_atol: 1.0e-6
      # Absolute CI-coefficients below this threshold are ignored in the overlap calculation.
      #
      # Possible values: positive float
@@ -137,6 +153,13 @@ below.
      #
      # Possible values: (True, False)
      mos_renorm: True
+     # Normalize every transition-density overlap by the self-overlap norms of its
+     # two states. This option changes numerical overlap values and is therefore
+     # disabled by default for backwards compatibility. It is only used when
+     # ovlp_type is tden.
+     #
+     # Possible values: (True, False)
+     normalize_tden: False
 
 By brief reasoning it would seem that :code:`mos_ref: ref` and :code:`mos_renorm: True` are
 more sensible choices, which is possibly true. Right now the present defaults are kept for
@@ -144,6 +167,133 @@ legacy reasons, and I'll update them after testing out the alternatives.
 
 Please also see :ref:`Example - Excited State Tracking <Plotting ES optimizations>`
 for possible visualizations when optimizing ES.
+
+Transactional ORCA 6.1.1 optimization with TDenTrack
+-----------------------------------------------------
+
+``TDenTrackORCA`` is an opt-in Python API for state-aware RFO steps.  Every
+trial geometry is evaluated by an isolated, energy-only ORCA child calculation.
+The child retains ``.cis``, BSON, GBW, input, and output artifacts in a unique
+audit directory.  Exact cross-geometry AO integrals are evaluated from the two
+BSON shell sets; the full signed transition-density overlap matrix and both
+within-geometry Gram matrices are passed to TDenTrack for root and manifold
+analysis.  They are carried as a complete metric-aware root-overlap block;
+TDenTrack first detects a near-degenerate manifold from energies and scalar
+scores, then takes the corresponding sub-block for principal-angle analysis.
+The committed root changes only after a selected-root ``EnGrad``
+calculation succeeds at the staged geometry.
+
+The initial all-root calculation closes the bootstrap loop as follows::
+
+   from excited_state_diabatizer.state_tracking import TrackingSession
+   from pysisyphus.Geometry import Geometry
+   from pysisyphus.calculators.ORCA import ORCA
+   from pysisyphus.calculators.ORCA6StateSurvey import (
+       bootstrap_tdentrack_snapshot,
+   )
+   from pysisyphus.calculators.TDenTrackORCA import TDenTrackORCA
+   from pysisyphus.optimizers.RFOptimizer import RFOptimizer
+
+   roots = tuple(range(1, 7))
+   td_block = "%tddft nroots 6 triplets true tda false end"
+
+   # Run once at the starting geometry. Do not put IRoot in this all-root job.
+   seed = ORCA(
+       keywords="uhf b3lyp def2-svp tightscf",
+       blocks=td_block,
+       root=None,
+       nroots=len(roots),
+       wavefunction_dump=True,
+       keep_kind="all",
+       out_dir="seed",
+   )
+   seed.get_all_energies(atoms, initial_cart_coords)
+   initial = bootstrap_tdentrack_snapshot(
+       seed,
+       atoms,
+       initial_cart_coords,
+       selected_root=2,
+       requested_roots=roots,
+   )
+   session = TrackingSession(initial)
+
+   calc = TDenTrackORCA(
+       keywords=seed.keywords,
+       blocks=td_block,
+       gbw=initial.artifacts["gbw"],
+       root=initial.selected_root,
+       nroots=len(roots),
+       tracking_session=session,
+       enable_default_survey=True,
+       default_survey_options={
+           "requested_roots": roots,
+           "expected_orca_version": "6.1.1",
+       },
+       out_dir="optimization",
+   )
+
+   geom = Geometry(atoms, initial_cart_coords, coord_type="redund")
+   geom.set_calculator(calc)
+   opt = RFOptimizer(
+       geom,
+       step_controller={
+           "type": "state_aware",
+           # The factor-1 proposal is always surveyed first. These are used
+           # only when that endpoint is mixed, weak, incomplete, or uphill.
+           "factors": (0.5, 0.75, 1.0, 1.25, 1.5),
+           "primary_factor": 1.0,
+           "fallback_only": True,
+           "require_descent": True,
+       },
+       out_dir="optimization",
+   )
+   opt.run()
+
+Attach ``calc`` to the geometry and enable the optimizer's ``step_controller``
+with the desired short/base/long factors.  This calculator is intentionally not
+registered as a YAML calculator: a live ``TrackingSession`` and, for advanced
+use, Python callback objects are required.
+
+The normal RFO proposal remains inside its current trust radius. Factors above
+one may bridge a narrow mixed region up to ``trust_max``. Going beyond that
+global maximum is deliberately a separate opt-in: set
+``respect_trust_max=False`` *and* provide a finite ``max_step_norm`` in the
+step-controller mapping. Accepted fallback endpoints are ranked by state
+energy, then overlap score and margin. The controller never commits an
+intermediate geometry along the scaled proposal.
+
+Post-step reparametrization and optimizer-specific implicit energy probes are
+disabled while transactional control is active. This includes RFO line search,
+GDIIS/GEDIIS, L-BFGS line search/regularization, and SQNM's pre-application and
+line search. Their unsurveyed geometries would otherwise precede the
+transaction boundary. A converged current geometry is detected before any new
+all-root survey is launched.
+
+For triplet calculations, candidate roots are **multiplicity-local ordinals**
+``1..N``.  Root ``k`` maps directly to ORCA ``IRoot k`` in the triplet gradient
+job.  It is never the raw, repeated ``iroot`` value stored inside mixed
+singlet/triplet CIS vector records, nor a global position in a combined printed
+state list.  The backend uses TDenTrack's ORCA 6 CIS parser for this mapping and
+for both TDA and non-TDA ``X+Y`` amplitudes.  If a two-record file is exactly
+ambiguous between a degenerate TDA pair and one non-TDA ``X+Y/X-Y`` pair, the
+input should state ``tda true`` or ``tda false`` explicitly; otherwise the
+survey fails closed.
+
+For a triplet gradient the adapter inserts and audits both ``IRoot k`` and
+``IRootMult triplet``. This matters in ORCA 6.1.1: ``Triplets true`` requests
+triplet roots but does not by itself make ``IRoot`` select the triplet block.
+The retained input echo, ``DE(CIS)`` root marker, state-of-interest report, and
+normal-termination marker must all agree before the electronic snapshot is
+committed. ``FollowIRoot true`` and ``TGradList`` are rejected because native
+root following or a multi-gradient job would make that authorization
+ambiguous.
+
+The committed reference must retain readable ``cis`` and ``bson`` artifact
+paths; these paths are serialized in calculator restart data.  The built-in
+backend currently assumes fixed atoms/order, basis, ECPs, multiplicity, and root
+window.  Point charges or other per-call preparation arguments must be supplied
+through ``default_survey_options["child_prepare_kwargs"]`` so the all-root
+survey and gradient Hamiltonians remain identical.
 
 Optimization of Conical Intersections
 -------------------------------------

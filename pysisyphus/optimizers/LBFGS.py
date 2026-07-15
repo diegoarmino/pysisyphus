@@ -78,6 +78,16 @@ class LBFGS(Optimizer):
         self.line_search = (not self.is_cos) and line_search
         self.control_step = control_step
 
+        if self.step_controller is not None:
+            if self.line_search or self.mu_reg:
+                self.log(
+                    "Disabling implicit L-BFGS line search and regularized "
+                    "trial-energy evaluations because transactional state-aware "
+                    "step control is active."
+                )
+            self.line_search = False
+            self.mu_reg = None
+
         self.tot_adapt_mu_cycles = 0
         if self.mu_reg:
             self.mu_reg_0 = self.mu_reg  # Backup value
