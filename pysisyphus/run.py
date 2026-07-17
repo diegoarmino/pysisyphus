@@ -99,6 +99,7 @@ CALC_DICT = {
     "turbomole": Turbomole,
     "xtb": XTB,
     "cfour": CFOUR,
+    "tdentrack_orca": TDenTrackORCA,
 }
 
 try:

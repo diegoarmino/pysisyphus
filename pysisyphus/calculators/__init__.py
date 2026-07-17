@@ -36,6 +36,7 @@ __all__ = [
     "Turbomole",
     "TransTorque",
     "XTB",
+    "TDenTrackORCA",
 ]
 
 
@@ -73,6 +74,7 @@ from pysisyphus.calculators.TransTorque import TransTorque
 from pysisyphus.calculators.Turbomole import Turbomole
 from pysisyphus.calculators.XTB import XTB
 from pysisyphus.calculators.CFOUR import CFOUR
+from pysisyphus.calculators.TDenTrackORCA import TDenTrackORCA
 
 
 logger = logging.getLogger("dimer")
