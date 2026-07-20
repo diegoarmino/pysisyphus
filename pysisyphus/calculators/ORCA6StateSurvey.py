@@ -39,6 +39,11 @@ MULTIPLICITY_LOCAL_ROOTS = "multiplicity-local-iroot"
 GLOBAL_STATE_ROOTS = "global-state-iroot"
 ROOT_NUMBERING_MODES = (MULTIPLICITY_LOCAL_ROOTS, GLOBAL_STATE_ROOTS)
 
+_FINAL_ENERGY_RE = re.compile(
+    r"FINAL SINGLE POINT ENERGY\s+"
+    r"([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][-+]?\d+)?)"
+)
+
 
 def _root_numbering_for(calculator: Any) -> str:
     """Return the ORCA root convention used by a calculator.
@@ -72,6 +77,45 @@ def _multiplicities_from_loaded(
             )
         multiplicities[root] = value
     return multiplicities
+
+
+def _align_state_energies_to_final(
+    all_energies: Any,
+    output_text: str,
+    *,
+    anchor_root: int,
+) -> tuple[np.ndarray, float]:
+    """Add ORCA's state-independent correction to every TDDFT root energy.
+
+    ``parse_all_energies`` constructs state totals from the printed ``E(SCF)``
+    and excitation energies.  ORCA applies state-independent contributions such
+    as D3(BJ) later, and the EnGrad ``.engrad`` energy contains them.  The final
+    energy therefore anchors either the selected gradient root or root zero for
+    an energy-only all-root survey.  Applying one common shift preserves every
+    excitation energy while keeping surveys, gradients, and optimizer descent
+    checks on the same potential-energy scale.
+    """
+
+    energies = np.asarray(all_energies, dtype=float).copy()
+    if energies.ndim != 1 or not np.all(np.isfinite(energies)):
+        raise ORCA6SurveyError("ORCA state energies must be a finite vector.")
+    anchor_root = int(anchor_root)
+    if anchor_root < 0 or anchor_root >= energies.size:
+        raise ORCA6SurveyError(
+            f"Energy anchor root {anchor_root} is outside 0..{energies.size - 1}."
+        )
+    matches = _FINAL_ENERGY_RE.findall(output_text)
+    if not matches:
+        raise ORCA6SurveyError(
+            "ORCA output lacks FINAL SINGLE POINT ENERGY; state energies "
+            "cannot be aligned with EnGrad energies."
+        )
+    final_energy = float(matches[-1].replace("D", "E").replace("d", "e"))
+    if not math.isfinite(final_energy):
+        raise ORCA6SurveyError("ORCA final single-point energy is non-finite.")
+    correction = final_energy - float(energies[anchor_root])
+    energies += correction
+    return energies, correction
 
 
 def _readonly_array(values: Any, *, ndim: Optional[int] = None) -> np.ndarray:
@@ -174,6 +218,7 @@ class ChildSurveyResult:
     multiplicities: Mapping[int, int]
     artifacts: Mapping[str, Path]
     orca_version: Optional[str] = None
+    energy_correction_eh: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.label:
@@ -200,6 +245,9 @@ class ChildSurveyResult:
                 raise ValueError(f"Child survey {name} are incomplete or non-finite.")
         if set(multiplicities) != set(roots):
             raise ValueError("Child survey multiplicities are incomplete.")
+        energy_correction = float(self.energy_correction_eh)
+        if not math.isfinite(energy_correction):
+            raise ValueError("Child survey energy correction must be finite.")
         object.__setattr__(self, "atoms", tuple(self.atoms))
         object.__setattr__(self, "coordinates", coordinates)
         object.__setattr__(self, "roots", roots)
@@ -209,6 +257,7 @@ class ChildSurveyResult:
         )
         object.__setattr__(self, "multiplicities", MappingProxyType(multiplicities))
         object.__setattr__(self, "artifacts", _path_mapping(self.artifacts))
+        object.__setattr__(self, "energy_correction_eh", energy_correction)
 
 
 def read_cis_active_space(path: Path) -> CISActiveSpace:
@@ -804,6 +853,11 @@ def bootstrap_tdentrack_snapshot(
         raise ORCA6SurveyError(
             f"Bootstrap root energies have shape {all_energies.shape}, expected {expected_shape}."
         )
+    all_energies, energy_correction = _align_state_energies_to_final(
+        all_energies,
+        output_text,
+        anchor_root=selected_root,
+    )
     ground = float(all_energies[0])
     energies = {root: float(all_energies[root]) for root in roots}
     excitations = {
@@ -859,6 +913,8 @@ def bootstrap_tdentrack_snapshot(
             "orca_version": version,
             "root_numbering": root_numbering,
             "state_survey_backend": "orca-6.1.1-bson-cis",
+            "energy_anchor_root": selected_root,
+            "state_independent_energy_correction_eh": energy_correction,
         },
     )
 
@@ -1030,6 +1086,8 @@ class ORCA6AllRootSurveyBackend:
             "orca_version": child.orca_version,
             "audit_directory": str(audit_dir),
             "root_numbering": self.root_numbering,
+            "energy_anchor_root": 0,
+            "state_independent_energy_correction_eh": child.energy_correction_eh,
         }
         manifest_path = audit_dir / "state_survey.json"
         candidate_artifacts = dict(child.artifacts)
@@ -1113,6 +1171,8 @@ class ORCA6AllRootSurveyBackend:
             "factor": float(factor),
             "orca_version": child.orca_version,
             "root_numbering": self.root_numbering,
+            "energy_anchor_root": 0,
+            "state_independent_energy_correction_eh": child.energy_correction_eh,
             "atoms": list(atoms),
             "coordinates_bohr": np.asarray(coordinates, dtype=float).reshape(-1).tolist(),
             "reference_roots": list(reference_state.roots),
@@ -1305,6 +1365,11 @@ class ORCA6AllRootSurveyBackend:
                 f"ORCA child energies have shape {all_energies.shape}; expected "
                 f"{(len(requested_roots) + 1,)}."
             )
+        all_energies, energy_correction = _align_state_energies_to_final(
+            all_energies,
+            output_text,
+            anchor_root=0,
+        )
         ground = float(all_energies[0])
         energies = {
             root: float(all_energies[root]) for root in requested_roots
@@ -1344,6 +1409,7 @@ class ORCA6AllRootSurveyBackend:
             multiplicities=multiplicities,
             artifacts=artifacts,
             orca_version=version,
+            energy_correction_eh=energy_correction,
         )
 
 

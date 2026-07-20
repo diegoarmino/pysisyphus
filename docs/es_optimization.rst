@@ -293,6 +293,16 @@ committed. ``FollowIRoot true`` and ``TGradList`` are rejected because native
 root following or a multi-gradient job would make that authorization
 ambiguous.
 
+ORCA's printed TDDFT state table is formed from ``E(SCF)`` plus excitation
+energies, whereas the final ``.engrad`` energy can also contain
+state-independent contributions applied later, such as D3(BJ). Bootstrap
+anchors the selected root to ``FINAL SINGLE POINT ENERGY`` and shifts the whole
+root window by the same amount. Energy-only surveys anchor root zero in the
+same way. Excitation energies are unchanged, while optimizer energies, descent
+checks, and fallback-step ranking remain on one corrected total-energy scale.
+The applied correction and anchor root are recorded in snapshot and survey
+metadata.
+
 The committed reference must retain readable ``cis`` and ``bson`` artifact
 paths; these paths are serialized in calculator restart data.  The built-in
 backend currently assumes fixed atoms/order, basis, ECPs, multiplicity, and root

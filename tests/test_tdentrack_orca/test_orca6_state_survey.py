@@ -412,11 +412,33 @@ def test_tda_hint_rejects_duplicate_directives():
         survey_module._tda_hint_from_blocks("%tddft tda true tda=false end")
 
 
+def test_state_energies_are_shifted_to_selected_engrad_energy():
+    raw = np.array([-10.2, -10.0, -9.9])
+    aligned, correction = survey_module._align_state_energies_to_final(
+        raw,
+        "FINAL SINGLE POINT ENERGY -10.413591023\n",
+        anchor_root=2,
+    )
+
+    assert correction == pytest.approx(-0.513591023)
+    assert aligned[2] == pytest.approx(-10.413591023)
+    np.testing.assert_allclose(np.diff(aligned), np.diff(raw))
+
+
+def test_state_energy_alignment_requires_final_energy():
+    with pytest.raises(ORCA6SurveyError, match="FINAL SINGLE POINT ENERGY"):
+        survey_module._align_state_energies_to_final(
+            [-10.2, -10.0], "normal output without final energy", anchor_root=1
+        )
+
+
 def test_bootstrap_builds_complete_multiplicity_local_snapshot(tmp_path):
     loaded_ref, _, coords, _ = make_loaded_pair()
     artifacts = touch_artifacts(tmp_path, "initial")
     artifacts["output"].write_text(
-        "Program Version 6.1.1 - RELEASE\n****ORCA TERMINATED NORMALLY****\n"
+        "Program Version 6.1.1 - RELEASE\n"
+        "FINAL SINGLE POINT ENERGY -9.900000000000\n"
+        "****ORCA TERMINATED NORMALLY****\n"
     )
 
     class CompletedCalculator:
@@ -456,6 +478,7 @@ def test_bootstrap_builds_complete_multiplicity_local_snapshot(tmp_path):
     assert snapshot.selected_root == 2
     assert snapshot.multiplicities == {1: 3, 2: 3}
     assert snapshot.energies_eh == {1: -10.0, 2: -9.9}
+    assert snapshot.metadata["state_independent_energy_correction_eh"] == pytest.approx(0.0)
     assert snapshot.metadata["root_numbering"] == "multiplicity-local-iroot"
     assert set(("cis", "bson", "gbw", "output")) <= set(snapshot.artifacts)
 
@@ -475,7 +498,9 @@ def test_bootstrap_open_shell_uses_global_roots_and_cis_multiplicities(tmp_path)
     )
     artifacts = touch_artifacts(tmp_path, "open_shell_initial")
     artifacts["output"].write_text(
-        "Program Version 6.1.1 - RELEASE\n****ORCA TERMINATED NORMALLY****\n"
+        "Program Version 6.1.1 - RELEASE\n"
+        "FINAL SINGLE POINT ENERGY -10.000000000000\n"
+        "****ORCA TERMINATED NORMALLY****\n"
     )
 
     class CompletedCalculator:
