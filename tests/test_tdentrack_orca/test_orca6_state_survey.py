@@ -275,6 +275,71 @@ def test_artifact_loader_uses_bson_coefficients_and_cis_ranges(
     assert parser_calls == [{"multiplicity": 3, "tda": False}]
 
 
+def test_artifact_loader_uses_global_roots_for_open_shell_reference(
+    tmp_path, monkeypatch
+):
+    loaded_ref, _, coords, _ = make_loaded_pair()
+    artifacts = touch_artifacts(tmp_path, "open_shell")
+    snapshot = Snapshot(
+        "open_shell",
+        coords,
+        (1, 2),
+        selected_root=1,
+        requested_roots=(1, 2),
+        multiplicities={1: 3, 2: 5},
+        artifacts=artifacts,
+    )
+    monkeypatch.setattr(
+        survey_module.Wavefunction,
+        "from_file",
+        lambda path: loaded_ref.wavefunction,
+    )
+    header = SimpleNamespace(
+        layout="orca-standard-vector-records",
+        alpha_occ_start=0,
+        alpha_occ_end=1,
+        alpha_virt_start=2,
+        alpha_virt_end=3,
+        beta_occ_start=0,
+        beta_occ_end=1,
+        beta_virt_start=2,
+        beta_virt_end=3,
+        alpha_nocc=2,
+        alpha_nvirt=2,
+        beta_nocc=2,
+        beta_nvirt=2,
+    )
+    transitions = loaded_ref.transition_alpha
+    parser_calls = []
+
+    def cis_parser(path, **kwargs):
+        parser_calls.append(kwargs)
+        return header, {
+            root: {
+                "global_root": root,
+                "multiplicity": multiplicity,
+                "root_within_multiplicity": 1,
+                "orca_gradient_iroot": 1,
+                "response_component": "tda-x",
+                "alpha": transitions[root - 1],
+                "beta": transitions[root - 1],
+            }
+            for root, multiplicity in ((1, 3), (2, 5))
+        }
+
+    state = ORCA6ArtifactLoader(
+        triplets=False,
+        multiplicity=3,
+        tda=True,
+        cis_parser=cis_parser,
+    )(snapshot, roots=(1, 2), atoms=("H", "H"), coordinates=coords)
+
+    assert state.roots == (1, 2)
+    assert state.root_metadata[1]["multiplicity"] == 3
+    assert state.root_metadata[2]["multiplicity"] == 5
+    assert parser_calls == [{"multiplicity": None, "tda": True}]
+
+
 def test_artifact_loader_rejects_duplicate_multiplicity_local_iroot(
     tmp_path, monkeypatch
 ):
@@ -393,3 +458,56 @@ def test_bootstrap_builds_complete_multiplicity_local_snapshot(tmp_path):
     assert snapshot.energies_eh == {1: -10.0, 2: -9.9}
     assert snapshot.metadata["root_numbering"] == "multiplicity-local-iroot"
     assert set(("cis", "bson", "gbw", "output")) <= set(snapshot.artifacts)
+
+
+def test_bootstrap_open_shell_uses_global_roots_and_cis_multiplicities(tmp_path):
+    loaded_ref, _, coords, _ = make_loaded_pair()
+    loaded_ref = LoadedORCA6State(
+        loaded_ref.wavefunction,
+        loaded_ref.roots,
+        loaded_ref.active_space,
+        loaded_ref.transition_alpha,
+        loaded_ref.transition_beta,
+        root_metadata={
+            1: {"global_root": 1, "multiplicity": 3},
+            2: {"global_root": 2, "multiplicity": 5},
+        },
+    )
+    artifacts = touch_artifacts(tmp_path, "open_shell_initial")
+    artifacts["output"].write_text(
+        "Program Version 6.1.1 - RELEASE\n****ORCA TERMINATED NORMALLY****\n"
+    )
+
+    class CompletedCalculator:
+        do_tddft = True
+        do_ice = False
+        triplets = False
+        mult = 3
+        nroots = 2
+        cis = artifacts["cis"]
+        bson = artifacts["bson"]
+        gbw = artifacts["gbw"]
+        out = artifacts["output"]
+        kept_history = {}
+
+        @staticmethod
+        def check_termination(text):
+            return "ORCA TERMINATED NORMALLY" in text
+
+        @staticmethod
+        def parse_all_energies(*, text, triplets):
+            assert not triplets
+            return np.array([-10.2, -10.0, -9.9])
+
+    snapshot = bootstrap_tdentrack_snapshot(
+        CompletedCalculator(),
+        ("H", "H"),
+        coords,
+        selected_root=1,
+        artifact_loader=lambda *args, **kwargs: loaded_ref,
+        snapshot_factory=Snapshot,
+    )
+
+    assert snapshot.roots == (1, 2)
+    assert snapshot.multiplicities == {1: 3, 2: 5}
+    assert snapshot.metadata["root_numbering"] == "global-state-iroot"

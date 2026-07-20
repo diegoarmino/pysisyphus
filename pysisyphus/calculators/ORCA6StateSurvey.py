@@ -35,6 +35,45 @@ class ORCA6SurveyError(RuntimeError):
     """Raised when an all-root ORCA survey cannot be trusted."""
 
 
+MULTIPLICITY_LOCAL_ROOTS = "multiplicity-local-iroot"
+GLOBAL_STATE_ROOTS = "global-state-iroot"
+ROOT_NUMBERING_MODES = (MULTIPLICITY_LOCAL_ROOTS, GLOBAL_STATE_ROOTS)
+
+
+def _root_numbering_for(calculator: Any) -> str:
+    """Return the ORCA root convention used by a calculator.
+
+    Restricted-reference spin-adapted triplets use an IRoot ordinal within the
+    triplet block.  Unrestricted open-shell calculations instead optimize the
+    global ``STATE N`` ordinal, even when the converged states have different
+    approximate multiplicities.
+    """
+
+    return (
+        MULTIPLICITY_LOCAL_ROOTS
+        if bool(getattr(calculator, "triplets", False))
+        else GLOBAL_STATE_ROOTS
+    )
+
+
+def _multiplicities_from_loaded(
+    state: "LoadedORCA6State", *, default: int
+) -> dict[int, int]:
+    default = int(default)
+    if default <= 0:
+        raise ORCA6SurveyError("The fallback multiplicity must be positive.")
+    multiplicities = {}
+    for root in state.roots:
+        value = state.root_metadata.get(root, {}).get("multiplicity", default)
+        value = default if value is None else int(value)
+        if value <= 0:
+            raise ORCA6SurveyError(
+                f"CIS root {root} has invalid multiplicity {value}."
+            )
+        multiplicities[root] = value
+    return multiplicities
+
+
 def _readonly_array(values: Any, *, ndim: Optional[int] = None) -> np.ndarray:
     array = np.asarray(values, dtype=float)
     if ndim is not None and array.ndim != ndim:
@@ -243,6 +282,7 @@ class ORCA6ArtifactLoader:
         *,
         triplets: bool,
         multiplicity: Optional[int] = None,
+        root_numbering: Optional[str] = None,
         tda: Optional[bool] = None,
         cis_parser: Optional[Callable[..., Any]] = None,
         energy_tolerance_eh: float = 5.0e-6,
@@ -253,6 +293,16 @@ class ORCA6ArtifactLoader:
         )
         if self.multiplicity <= 0:
             raise ValueError("multiplicity must be a positive integer.")
+        if root_numbering is None:
+            root_numbering = (
+                MULTIPLICITY_LOCAL_ROOTS if self.triplets else GLOBAL_STATE_ROOTS
+            )
+        if root_numbering not in ROOT_NUMBERING_MODES:
+            raise ValueError(
+                f"root_numbering must be one of {ROOT_NUMBERING_MODES}, got "
+                f"{root_numbering!r}."
+            )
+        self.root_numbering = root_numbering
         self.tda = None if tda is None else bool(tda)
         self.cis_parser = (
             _tdentrack_parse_cis_amplitudes if cis_parser is None else cis_parser
@@ -295,7 +345,11 @@ class ORCA6ArtifactLoader:
         try:
             header, parsed = self.cis_parser(
                 cis_path,
-                multiplicity=self.multiplicity,
+                multiplicity=(
+                    self.multiplicity
+                    if self.root_numbering == MULTIPLICITY_LOCAL_ROOTS
+                    else None
+                ),
                 tda=self.tda,
             )
         except Exception as exc:
@@ -304,37 +358,41 @@ class ORCA6ArtifactLoader:
             ) from exc
 
         roots = tuple(int(root) for root in roots)
-        by_local_root: dict[int, Mapping[str, Any]] = {}
+        by_root: dict[int, Mapping[str, Any]] = {}
         for global_root, state in parsed.items():
             encoded_multiplicity = state.get("multiplicity")
             if (
-                encoded_multiplicity is not None
+                self.root_numbering == MULTIPLICITY_LOCAL_ROOTS
+                and encoded_multiplicity is not None
                 and int(encoded_multiplicity) != self.multiplicity
             ):
                 raise ORCA6SurveyError(
                     f"CIS global root {global_root} has multiplicity "
                     f"{encoded_multiplicity}, expected {self.multiplicity}."
                 )
-            local_root = state.get("orca_gradient_iroot")
-            if local_root is None:
-                if getattr(header, "layout", "").startswith("orca-legacy-"):
-                    local_root = global_root
-                else:
-                    raise ORCA6SurveyError(
-                        f"CIS global root {global_root} lacks multiplicity-local "
-                        "ORCA gradient IRoot metadata."
-                    )
-            local_root = int(local_root)
-            if local_root in by_local_root:
+            if self.root_numbering == GLOBAL_STATE_ROOTS:
+                root = int(global_root)
+            else:
+                root = state.get("orca_gradient_iroot")
+                if root is None:
+                    if getattr(header, "layout", "").startswith("orca-legacy-"):
+                        root = global_root
+                    else:
+                        raise ORCA6SurveyError(
+                            f"CIS global root {global_root} lacks multiplicity-local "
+                            "ORCA gradient IRoot metadata."
+                        )
+                root = int(root)
+            if root in by_root:
                 raise ORCA6SurveyError(
-                    f"CIS data map more than one state to local IRoot {local_root}."
+                    f"CIS data map more than one state to {self.root_numbering} "
+                    f"root {root}."
                 )
-            by_local_root[local_root] = state
-        if tuple(sorted(by_local_root)) != roots:
+            by_root[root] = state
+        if tuple(sorted(by_root)) != roots:
             raise ORCA6SurveyError(
-                "Multiplicity-filtered CIS roots do not match the requested local "
-                f"IRoot window {roots}; available local roots are "
-                f"{tuple(sorted(by_local_root))}."
+                f"CIS {self.root_numbering} roots do not match the requested "
+                f"window {roots}; available roots are {tuple(sorted(by_root))}."
             )
         active = CISActiveSpace(
             alpha_occ=(header.alpha_occ_start, header.alpha_occ_end),
@@ -350,7 +408,7 @@ class ORCA6ArtifactLoader:
         snapshot_multiplicities = getattr(snapshot, "multiplicities", {})
         snapshot_excitations = getattr(snapshot, "excitation_energies_ev", {})
         for root in roots:
-            state = by_local_root[root]
+            state = by_root[root]
             alpha = np.asarray(state["alpha"], dtype=float)
             beta = np.asarray(state["beta"], dtype=float)
             if alpha.shape != expected_alpha or beta.shape != expected_beta:
@@ -365,8 +423,20 @@ class ORCA6ArtifactLoader:
                     f"{state.get('response_component')!r}."
                 )
             snapshot_multiplicity = snapshot_multiplicities.get(root)
+            state_multiplicity = state.get("multiplicity")
             if (
                 snapshot_multiplicity is not None
+                and state_multiplicity is not None
+                and int(snapshot_multiplicity) != int(state_multiplicity)
+            ):
+                raise ORCA6SurveyError(
+                    f"Snapshot root {root} has multiplicity "
+                    f"{snapshot_multiplicity}, but CIS encodes "
+                    f"{state_multiplicity}."
+                )
+            if (
+                self.root_numbering == MULTIPLICITY_LOCAL_ROOTS
+                and snapshot_multiplicity is not None
                 and int(snapshot_multiplicity) != self.multiplicity
             ):
                 raise ORCA6SurveyError(
@@ -381,7 +451,8 @@ class ORCA6ArtifactLoader:
                 )
                 if error > self.energy_tolerance_eh:
                     raise ORCA6SurveyError(
-                        f"CIS/output excitation-energy mismatch for local IRoot "
+                        f"CIS/output excitation-energy mismatch for "
+                        f"{self.root_numbering} "
                         f"{root}: {error:.3e} Eh exceeds "
                         f"{self.energy_tolerance_eh:.3e} Eh."
                     )
@@ -659,10 +730,10 @@ def bootstrap_tdentrack_snapshot(
 ) -> Any:
     """Build the initial committed snapshot from a completed all-root ORCA job.
 
-    Root identifiers are multiplicity-local ordinals ``1..N``.  For a triplet
-    survey, root ``k`` is the triplet ``IRoot k`` used by an ORCA gradient—not
-    ORCA's repeated raw CIS-vector ``iroot`` field or a global singlet+triplet
-    output position.
+    Restricted-reference spin-adapted triplets use multiplicity-local IRoot
+    ordinals.  Unrestricted open-shell calculations use global ``STATE N``
+    ordinals because states of different approximate multiplicity may be
+    interleaved in one root window.
 
     ``snapshot_factory`` and ``artifact_loader`` are injection points for
     offline tests.  Production calls omit both and receive a real tdentrack
@@ -682,7 +753,8 @@ def bootstrap_tdentrack_snapshot(
     expected_roots = tuple(range(1, len(roots) + 1))
     if roots != expected_roots:
         raise ORCA6SurveyError(
-            f"Bootstrap roots must be multiplicity-local ordinals {expected_roots}, got {roots}."
+            f"Bootstrap roots must be contiguous one-based ordinals "
+            f"{expected_roots}, got {roots}."
         )
     selected_root = int(selected_root)
     if selected_root not in roots:
@@ -737,14 +809,15 @@ def bootstrap_tdentrack_snapshot(
     excitations = {
         root: (energy - ground) * AU2EV for root, energy in energies.items()
     }
-    multiplicity = 3 if calculator.triplets else int(calculator.mult)
-    multiplicities = {root: multiplicity for root in roots}
+    root_numbering = _root_numbering_for(calculator)
+    default_multiplicity = 3 if calculator.triplets else int(calculator.mult)
 
     probe = SimpleNamespace(label=label, artifacts=artifacts)
     loader = (
         ORCA6ArtifactLoader(
             triplets=calculator.triplets,
-            multiplicity=(3 if calculator.triplets else int(calculator.mult)),
+            multiplicity=default_multiplicity,
+            root_numbering=root_numbering,
             tda=(
                 _tda_hint_from_blocks(getattr(calculator, "blocks", ""))
                 if tda is None
@@ -768,6 +841,9 @@ def bootstrap_tdentrack_snapshot(
         raise ORCA6SurveyError(
             f"Bootstrap CIS roots {loaded.roots} do not match requested roots {roots}."
         )
+    multiplicities = _multiplicities_from_loaded(
+        loaded, default=default_multiplicity
+    )
     factory = _tdentrack_snapshot_class() if snapshot_factory is None else snapshot_factory
     return factory(
         label=label,
@@ -781,7 +857,7 @@ def bootstrap_tdentrack_snapshot(
         artifacts=artifacts,
         metadata={
             "orca_version": version,
-            "root_numbering": "multiplicity-local-iroot",
+            "root_numbering": root_numbering,
             "state_survey_backend": "orca-6.1.1-bson-cis",
         },
     )
@@ -805,6 +881,7 @@ class ORCA6AllRootSurveyBackend:
         tda: Optional[bool] = None,
     ) -> None:
         self.parent = parent
+        self.root_numbering = _root_numbering_for(parent)
         self.requested_roots = (
             None if requested_roots is None else tuple(int(root) for root in requested_roots)
         )
@@ -822,6 +899,7 @@ class ORCA6AllRootSurveyBackend:
             ORCA6ArtifactLoader(
                 triplets=parent.triplets,
                 multiplicity=(3 if parent.triplets else int(parent.mult)),
+                root_numbering=self.root_numbering,
                 tda=(
                     _tda_hint_from_blocks(parent.blocks)
                     if tda is None
@@ -951,7 +1029,7 @@ class ORCA6AllRootSurveyBackend:
             "survey_factor": float(factor),
             "orca_version": child.orca_version,
             "audit_directory": str(audit_dir),
-            "root_numbering": "multiplicity-local-iroot",
+            "root_numbering": self.root_numbering,
         }
         manifest_path = audit_dir / "state_survey.json"
         candidate_artifacts = dict(child.artifacts)
@@ -1034,6 +1112,7 @@ class ORCA6AllRootSurveyBackend:
             "reference_root": int(reference.selected_root),
             "factor": float(factor),
             "orca_version": child.orca_version,
+            "root_numbering": self.root_numbering,
             "atoms": list(atoms),
             "coordinates_bohr": np.asarray(coordinates, dtype=float).reshape(-1).tolist(),
             "reference_roots": list(reference_state.roots),
@@ -1233,8 +1312,28 @@ class ORCA6AllRootSurveyBackend:
         excitations = {
             root: (energy - ground) * AU2EV for root, energy in energies.items()
         }
-        multiplicity = 3 if parent.triplets else parent.mult
-        multiplicities = {root: multiplicity for root in requested_roots}
+        default_multiplicity = 3 if parent.triplets else int(parent.mult)
+        probe = SimpleNamespace(
+            label=label,
+            artifacts=artifacts,
+            multiplicities={},
+            excitation_energies_ev=excitations,
+        )
+        loaded = self.artifact_loader(
+            probe,
+            roots=requested_roots,
+            atoms=atoms,
+            coordinates=coordinates,
+        )
+        _validate_wavefunction(
+            loaded,
+            atoms,
+            coordinates,
+            atol=self.validation_tolerance,
+        )
+        multiplicities = _multiplicities_from_loaded(
+            loaded, default=default_multiplicity
+        )
         return ChildSurveyResult(
             label=label,
             atoms=atoms,

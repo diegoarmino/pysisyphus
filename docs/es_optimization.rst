@@ -269,19 +269,24 @@ line search. Their unsurveyed geometries would otherwise precede the
 transaction boundary. A converged current geometry is detected before any new
 all-root survey is launched.
 
-For triplet calculations, candidate roots are **multiplicity-local ordinals**
-``1..N``.  Root ``k`` maps directly to ORCA ``IRoot k`` in the triplet gradient
-job.  It is never the raw, repeated ``iroot`` value stored inside mixed
-singlet/triplet CIS vector records, nor a global position in a combined printed
-state list.  The backend uses TDenTrack's ORCA 6 CIS parser for this mapping and
-for both TDA and non-TDA ``X+Y`` amplitudes.  If a two-record file is exactly
-ambiguous between a degenerate TDA pair and one non-TDA ``X+Y/X-Y`` pair, the
-input should state ``tda true`` or ``tda false`` explicitly; otherwise the
-survey fails closed.
+Root numbering follows the reference type.  Closed-shell spin-adapted triplets
+use **multiplicity-local ordinals** ``1..N``; root ``k`` maps to triplet
+``IRoot k`` and ``IRootMult triplet``.  Unrestricted open-shell references use
+the global printed ``STATE N`` ordinal because roots of different approximate
+multiplicity can be interleaved in one TDDFT window.  Their per-root
+multiplicities are retained from the CIS records so TDenTrack can reject an
+incompatible spin manifold without renumbering the ORCA gradient root.  The
+backend uses TDenTrack's ORCA 6 CIS parser for both conventions and for both
+TDA and non-TDA ``X+Y`` amplitudes.  If a two-record file is exactly ambiguous
+between a degenerate TDA pair and one non-TDA ``X+Y/X-Y`` pair, the input should
+state ``tda true`` or ``tda false`` explicitly; otherwise the survey fails
+closed.
 
-For a triplet gradient the adapter inserts and audits both ``IRoot k`` and
-``IRootMult triplet``. This matters in ORCA 6.1.1: ``Triplets true`` requests
-triplet roots but does not by itself make ``IRoot`` select the triplet block.
+For a closed-shell spin-adapted triplet gradient the adapter inserts and audits
+both ``IRoot k`` and ``IRootMult triplet``. This matters in ORCA 6.1.1:
+``Triplets true`` requests triplet roots but does not by itself make ``IRoot``
+select the triplet block.  An unrestricted open-shell gradient instead uses
+the global ``IRoot k`` without ``IRootMult``.
 The retained input echo, ``DE(CIS)`` root marker, state-of-interest report, and
 normal-termination marker must all agree before the electronic snapshot is
 committed. ``FollowIRoot true`` and ``TGradList`` are rejected because native
