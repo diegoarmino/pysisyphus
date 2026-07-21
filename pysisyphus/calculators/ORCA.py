@@ -949,8 +949,11 @@ class ORCA(OverlapCalculator):
                 # Redo the calculation with the updated root
                 results = func(atoms, coords, **prepare_kwargs)
         results["all_energies"] = self.parse_all_energies()
-        # Set energy of current root if set
-        if self.root is not None:
+        # Energy-only excited-state jobs need the selected value reconstructed
+        # from the state table. Gradient parsers already return ORCA's native
+        # .engrad energy, including late corrections such as D3(BJ); do not
+        # overwrite that authoritative value with the uncorrected table total.
+        if self.root is not None and "forces" not in results:
             results["energy"] = results["all_energies"][self.root]
         return results
 

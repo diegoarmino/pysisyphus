@@ -57,6 +57,25 @@ def test_orca_rejects_multiple_iroot_directives(tmp_path):
         )
 
 
+def test_orca_gradient_keeps_native_engrad_energy(tmp_path, monkeypatch):
+    calc = ORCA(
+        keywords="uhf b3lyp def2-svp",
+        blocks="%tddft nroots 2 end",
+        root=1,
+        check_mem=False,
+        wavefunction_dump=False,
+        out_dir=tmp_path,
+    )
+    state_table = np.array([-10.2, -10.0, -9.9])
+    monkeypatch.setattr(calc, "parse_all_energies", lambda: state_table)
+    native = {"energy": -10.5, "forces": np.zeros(6)}
+
+    result = calc.store_and_track(native, None, ("H", "H"), np.zeros(6))
+
+    assert result["energy"] == pytest.approx(-10.5)
+    np.testing.assert_allclose(result["all_energies"], state_table)
+
+
 def _native_gradient_output(root=2, label="Triplet", input_root=None):
     input_root = root if input_root is None else input_root
     return f"""
@@ -117,7 +136,7 @@ def test_native_gradient_output_rejects_wrong_state(
         calc._validate_native_gradient_output(2)
 
 
-def test_native_tda_reference_energy_is_normalized_to_selected_state(
+def test_native_engrad_energy_is_normalized_to_selected_state(
     tmp_path, initial_snapshot
 ):
     snapshot = replace(
@@ -130,19 +149,23 @@ def test_native_tda_reference_energy_is_normalized_to_selected_state(
         lambda *args, **kwargs: None,
         successful_gradient([]),
     )
-    raw = {"energy": -10.2, "forces": np.zeros_like(snapshot.coordinates)}
+    raw = {
+        "energy": -10.0,
+        "forces": np.zeros_like(snapshot.coordinates),
+        "all_energies": np.array([-10.2, -10.0, -9.9]),
+    }
 
     normalized = calc._normalize_native_gradient_energy(raw, snapshot, 1)
 
     assert set(normalized) == {"energy", "forces"}
-    assert calc.last_orca_engrad_energy == pytest.approx(-10.2)
+    assert calc.last_orca_engrad_energy == pytest.approx(-10.0)
     assert normalized["energy"] == pytest.approx(-10.0)
     geom = Geometry(("H", "H"), snapshot.coordinates, coord_type="cart")
     geom.set_results(normalized)
     assert geom.energy == pytest.approx(-10.0)
 
 
-def test_native_gradient_energy_must_match_state_or_final_anchor(
+def test_native_gradient_energy_must_match_selected_state(
     tmp_path, initial_snapshot
 ):
     snapshot = replace(
@@ -157,7 +180,7 @@ def test_native_gradient_energy_must_match_state_or_final_anchor(
     )
     raw = {"energy": -11.0, "forces": np.zeros_like(snapshot.coordinates)}
 
-    with pytest.raises(GradientProtocolError, match="matches neither"):
+    with pytest.raises(GradientProtocolError, match="differs from"):
         calc._normalize_native_gradient_energy(raw, snapshot, 1)
 
 

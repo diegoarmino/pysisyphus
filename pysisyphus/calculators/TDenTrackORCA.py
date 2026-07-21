@@ -745,13 +745,13 @@ class TDenTrackORCA(ORCA):
     ) -> Mapping[str, Any]:
         """Use the audited selected-state energy with ORCA's excited gradient.
 
-        Some ORCA 6.1.1 TDA EnGrad paths write the corrected reference energy
-        to ``.engrad``/``FINAL SINGLE POINT ENERGY`` even though the force is
-        for the requested excited root. The all-root snapshot contains the
-        corresponding corrected state energy. Accept an EnGrad scalar that
-        matches either the selected state or ORCA's audited final-energy anchor,
+        The all-root survey and selected-root EnGrad must agree at the same
+        geometry.  ORCA's native ``.engrad`` scalar includes late corrections
+        such as D3(BJ), whereas its printed TDDFT state table does not.  Require
+        the native scalar to match the audited selected-state survey energy,
         retain it on the calculator and in ORCA's files for provenance, and
-        expose only the selected-state energy to the optimizer.
+        remove the uncorrected legacy ``all_energies`` array before returning
+        the result to the optimizer.
         """
 
         requested_root = int(requested_root)
@@ -766,28 +766,17 @@ class TDenTrackORCA(ORCA):
             raise GradientProtocolError(
                 "Selected-state and ORCA EnGrad energies must be finite."
             )
-        metadata = dict(getattr(snapshot, "metadata", {}))
-        allowed = {"selected state": selected_energy}
-        final_energy = metadata.get("final_single_point_energy_eh")
-        if final_energy is not None:
-            final_energy = float(final_energy)
-            if not math.isfinite(final_energy):
-                raise GradientProtocolError(
-                    "Audited FINAL SINGLE POINT ENERGY must be finite."
-                )
-            allowed["FINAL SINGLE POINT ENERGY anchor"] = final_energy
-        errors = {
-            label: abs(raw_energy - value) for label, value in allowed.items()
-        }
-        if min(errors.values()) > float(tolerance_eh):
+        error = abs(raw_energy - selected_energy)
+        if error > float(tolerance_eh):
             raise GradientProtocolError(
-                f"ORCA EnGrad energy {raw_energy:.12f} Eh matches neither the "
-                "selected-state nor audited final-anchor energy; errors are "
-                f"{errors} Eh."
+                f"Native ORCA EnGrad energy {raw_energy:.12f} Eh differs from "
+                f"selected-state survey energy {selected_energy:.12f} Eh by "
+                f"{error:.6e} Eh."
             )
         normalized = dict(result)
         self.last_orca_engrad_energy = raw_energy
         normalized["energy"] = selected_energy
+        normalized.pop("all_energies", None)
         return normalized
 
     def _validate_native_gradient_output(self, requested_root: int) -> None:
