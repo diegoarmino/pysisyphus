@@ -309,11 +309,13 @@ provenance; it does not choose the state followed by the optimizer.
 
 Before a native gradient is returned, its raw scalar must match either the
 audited final anchor or the selected-state energy at that geometry.  The raw
-value is retained as ``orca_engrad_energy``, while the optimizer receives the
-selected-state energy from the complete, same-geometry root survey.  Excitation
-energies are unchanged, and optimizer descent checks and fallback-step ranking
-remain on one corrected excited-state energy scale.  The applied correction,
-final scalar, and anchor root are recorded in snapshot and survey metadata.
+value remains in the retained ORCA files and is exposed as the calculator's
+``last_orca_engrad_energy`` attribute, while the optimizer result contains only
+the selected-state energy from the complete, same-geometry root survey and its
+forces.  Excitation energies are unchanged, and optimizer descent checks and
+fallback-step ranking remain on one corrected excited-state energy scale.  The
+applied correction, final scalar, and anchor root are recorded in snapshot and
+survey metadata.
 
 When implicit solvent is active, ``CPCMEQ`` must be stated explicitly in the
 ``%tddft``/``%cis`` block. ORCA defaults a vertical energy-only calculation to

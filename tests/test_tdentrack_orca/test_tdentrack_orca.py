@@ -8,6 +8,7 @@ import re
 import numpy as np
 import pytest
 
+from pysisyphus.Geometry import Geometry
 from pysisyphus.calculators.ORCA import ORCA
 from pysisyphus.calculators.TDenTrackORCA import (
     GradientProtocolError,
@@ -133,8 +134,12 @@ def test_native_tda_reference_energy_is_normalized_to_selected_state(
 
     normalized = calc._normalize_native_gradient_energy(raw, snapshot, 1)
 
-    assert normalized["orca_engrad_energy"] == pytest.approx(-10.2)
+    assert set(normalized) == {"energy", "forces"}
+    assert calc.last_orca_engrad_energy == pytest.approx(-10.2)
     assert normalized["energy"] == pytest.approx(-10.0)
+    geom = Geometry(("H", "H"), snapshot.coordinates, coord_type="cart")
+    geom.set_results(normalized)
+    assert geom.energy == pytest.approx(-10.0)
 
 
 def test_native_gradient_energy_must_match_state_or_final_anchor(

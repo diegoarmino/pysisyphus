@@ -380,6 +380,7 @@ class TDenTrackORCA(ORCA):
         self.survey_runner = survey_runner
         self.default_survey_backend = None
         self.gradient_runner = gradient_runner
+        self.last_orca_engrad_energy = None
         self.coordinate_tolerance = coordinate_tolerance
         self.require_declared_root_window = bool(require_declared_root_window)
         self.survey_against = survey_against
@@ -734,8 +735,8 @@ class TDenTrackORCA(ORCA):
             raise GradientProtocolError("Gradient forces contain non-finite values.")
         return result
 
-    @staticmethod
     def _normalize_native_gradient_energy(
+        self,
         result: Mapping[str, Any],
         snapshot: Any,
         requested_root: int,
@@ -749,8 +750,8 @@ class TDenTrackORCA(ORCA):
         for the requested excited root. The all-root snapshot contains the
         corresponding corrected state energy. Accept an EnGrad scalar that
         matches either the selected state or ORCA's audited final-energy anchor,
-        retain it for provenance, and expose the selected-state energy to the
-        optimizer.
+        retain it on the calculator and in ORCA's files for provenance, and
+        expose only the selected-state energy to the optimizer.
         """
 
         requested_root = int(requested_root)
@@ -785,7 +786,7 @@ class TDenTrackORCA(ORCA):
                 f"{errors} Eh."
             )
         normalized = dict(result)
-        normalized["orca_engrad_energy"] = raw_energy
+        self.last_orca_engrad_energy = raw_energy
         normalized["energy"] = selected_energy
         return normalized
 
