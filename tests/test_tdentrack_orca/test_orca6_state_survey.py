@@ -498,6 +498,22 @@ def test_tda_engrad_final_energy_may_anchor_reference_not_selected_root():
     assert aligned[2] != pytest.approx(final)
 
 
+def test_energy_only_final_energy_may_anchor_first_excited_state():
+    raw = np.array([-10.2, -10.0, -9.9])
+    aligned, correction, anchor, final = survey_module._align_state_energies_to_final(
+        raw,
+        "Dispersion correction -0.5\n"
+        "FINAL SINGLE POINT ENERGY -10.5\n",
+        anchor_roots=range(raw.size),
+    )
+
+    assert correction == pytest.approx(-0.5)
+    assert anchor == 1
+    assert final == pytest.approx(-10.5)
+    assert aligned[0] == pytest.approx(-10.7)
+    assert aligned[1] == pytest.approx(final)
+
+
 def test_state_energy_alignment_requires_final_energy():
     with pytest.raises(ORCA6SurveyError, match="FINAL SINGLE POINT ENERGY"):
         survey_module._align_state_energies_to_final(

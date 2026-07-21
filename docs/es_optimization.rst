@@ -302,7 +302,10 @@ selected excited state or the reference state even though the reported force
 is for the requested excited root.  Bootstrap therefore parses the printed
 numeric dispersion correction, applies that one common correction to the
 whole root window, and audits whether the final scalar is anchored at root zero
-or the requested root.  Energy-only surveys require a root-zero anchor.
+or the requested root.  Energy-only excited-state jobs are checked against the
+entire parsed state window because ORCA may make the first excited state,
+rather than root zero, its final scalar.  The anchor identifies the scalar's
+provenance; it does not choose the state followed by the optimizer.
 
 Before a native gradient is returned, its raw scalar must match either the
 audited final anchor or the selected-state energy at that geometry.  The raw

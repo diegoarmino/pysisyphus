@@ -96,12 +96,14 @@ def _align_state_energies_to_final(
     ``parse_all_energies`` constructs state totals from the printed ``E(SCF)``
     and excitation energies.  ORCA applies state-independent contributions such
     as D3(BJ) later, and the EnGrad ``.engrad`` energy contains them.  The final
-    energy may anchor either the selected gradient root or root zero, depending
-    on ORCA's TDDFT/TDA output path.  When ORCA prints a dispersion correction,
-    it is the state-independent shift; ``FINAL SINGLE POINT ENERGY`` is then
-    used only to identify and validate its anchor. Applying one common shift
-    preserves every excitation energy while keeping surveys, gradients, and
-    optimizer descent checks on the same potential-energy scale.
+    energy may anchor different state totals depending on ORCA's TDDFT/TDA
+    output path.  In particular, an energy-only excited-state job may report
+    the first excited state rather than root zero.  When ORCA prints a
+    dispersion correction, it is the state-independent shift;
+    ``FINAL SINGLE POINT ENERGY`` is then used only to identify and validate
+    its anchor. Applying one common shift preserves every excitation energy
+    while keeping surveys, gradients, and optimizer descent checks on the same
+    potential-energy scale.
     """
 
     energies = np.asarray(all_energies, dtype=float).copy()
@@ -1551,7 +1553,7 @@ class ORCA6AllRootSurveyBackend:
         ) = _align_state_energies_to_final(
             all_energies,
             output_text,
-            anchor_roots=(0,),
+            anchor_roots=tuple(range(all_energies.size)),
         )
         ground = float(all_energies[0])
         energies = {
