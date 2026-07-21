@@ -734,6 +734,61 @@ class TDenTrackORCA(ORCA):
             raise GradientProtocolError("Gradient forces contain non-finite values.")
         return result
 
+    @staticmethod
+    def _normalize_native_gradient_energy(
+        result: Mapping[str, Any],
+        snapshot: Any,
+        requested_root: int,
+        *,
+        tolerance_eh: float = 5.0e-5,
+    ) -> Mapping[str, Any]:
+        """Use the audited selected-state energy with ORCA's excited gradient.
+
+        Some ORCA 6.1.1 TDA EnGrad paths write the corrected reference energy
+        to ``.engrad``/``FINAL SINGLE POINT ENERGY`` even though the force is
+        for the requested excited root. The all-root snapshot contains the
+        corresponding corrected state energy. Accept an EnGrad scalar that
+        matches either the selected state or ORCA's audited final-energy anchor,
+        retain it for provenance, and expose the selected-state energy to the
+        optimizer.
+        """
+
+        requested_root = int(requested_root)
+        try:
+            selected_energy = float(snapshot.energies_eh[requested_root])
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise GradientProtocolError(
+                f"Snapshot has no finite energy for selected root {requested_root}."
+            ) from exc
+        raw_energy = float(result["energy"])
+        if not math.isfinite(selected_energy) or not math.isfinite(raw_energy):
+            raise GradientProtocolError(
+                "Selected-state and ORCA EnGrad energies must be finite."
+            )
+        metadata = dict(getattr(snapshot, "metadata", {}))
+        allowed = {"selected state": selected_energy}
+        final_energy = metadata.get("final_single_point_energy_eh")
+        if final_energy is not None:
+            final_energy = float(final_energy)
+            if not math.isfinite(final_energy):
+                raise GradientProtocolError(
+                    "Audited FINAL SINGLE POINT ENERGY must be finite."
+                )
+            allowed["FINAL SINGLE POINT ENERGY anchor"] = final_energy
+        errors = {
+            label: abs(raw_energy - value) for label, value in allowed.items()
+        }
+        if min(errors.values()) > float(tolerance_eh):
+            raise GradientProtocolError(
+                f"ORCA EnGrad energy {raw_energy:.12f} Eh matches neither the "
+                "selected-state nor audited final-anchor energy; errors are "
+                f"{errors} Eh."
+            )
+        normalized = dict(result)
+        normalized["orca_engrad_energy"] = raw_energy
+        normalized["energy"] = selected_energy
+        return normalized
+
     def _validate_native_gradient_output(self, requested_root: int) -> None:
         """Certify the retained ORCA EnGrad output before state commitment.
 
@@ -874,6 +929,9 @@ class TDenTrackORCA(ORCA):
             result = self._run_selected_gradient(atoms, coordinates, root, prepare_kwargs)
             if self.gradient_runner is None:
                 self._validate_native_gradient_output(root)
+                result = self._normalize_native_gradient_energy(
+                    result, committed, root
+                )
             return self._validate_gradient_result(result, coordinates)
         except BaseException:
             self.root = previous_root
@@ -926,6 +984,9 @@ class TDenTrackORCA(ORCA):
                 )
                 if self.gradient_runner is None:
                     self._validate_native_gradient_output(root)
+                    gradient = self._normalize_native_gradient_energy(
+                        gradient, result.data.candidate, root
+                    )
                 gradient = self._validate_gradient_result(gradient, coordinates)
                 committed = self.tracking_session.commit(
                     result.decision,

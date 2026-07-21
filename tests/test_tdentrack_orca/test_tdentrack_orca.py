@@ -116,6 +116,46 @@ def test_native_gradient_output_rejects_wrong_state(
         calc._validate_native_gradient_output(2)
 
 
+def test_native_tda_reference_energy_is_normalized_to_selected_state(
+    tmp_path, initial_snapshot
+):
+    snapshot = replace(
+        initial_snapshot,
+        metadata={"final_single_point_energy_eh": -10.2},
+    )
+    calc = make_calc(
+        tmp_path,
+        snapshot,
+        lambda *args, **kwargs: None,
+        successful_gradient([]),
+    )
+    raw = {"energy": -10.2, "forces": np.zeros_like(snapshot.coordinates)}
+
+    normalized = calc._normalize_native_gradient_energy(raw, snapshot, 1)
+
+    assert normalized["orca_engrad_energy"] == pytest.approx(-10.2)
+    assert normalized["energy"] == pytest.approx(-10.0)
+
+
+def test_native_gradient_energy_must_match_state_or_final_anchor(
+    tmp_path, initial_snapshot
+):
+    snapshot = replace(
+        initial_snapshot,
+        metadata={"final_single_point_energy_eh": -10.2},
+    )
+    calc = make_calc(
+        tmp_path,
+        snapshot,
+        lambda *args, **kwargs: None,
+        successful_gradient([]),
+    )
+    raw = {"energy": -11.0, "forces": np.zeros_like(snapshot.coordinates)}
+
+    with pytest.raises(GradientProtocolError, match="matches neither"):
+        calc._normalize_native_gradient_energy(raw, snapshot, 1)
+
+
 class Status(str, Enum):
     ACCEPT = "ACCEPT"
     RETRY = "RETRY"

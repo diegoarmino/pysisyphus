@@ -468,21 +468,49 @@ def test_lr_cpcm_output_regime_must_match_explicit_setting():
 
 def test_state_energies_are_shifted_to_selected_engrad_energy():
     raw = np.array([-10.2, -10.0, -9.9])
-    aligned, correction = survey_module._align_state_energies_to_final(
+    aligned, correction, anchor, final = survey_module._align_state_energies_to_final(
         raw,
+        "Dispersion correction -0.513591023\n"
         "FINAL SINGLE POINT ENERGY -10.413591023\n",
-        anchor_root=2,
+        anchor_roots=(0, 2),
     )
 
     assert correction == pytest.approx(-0.513591023)
+    assert anchor == 2
+    assert final == pytest.approx(-10.413591023)
     assert aligned[2] == pytest.approx(-10.413591023)
     np.testing.assert_allclose(np.diff(aligned), np.diff(raw))
+
+
+def test_tda_engrad_final_energy_may_anchor_reference_not_selected_root():
+    raw = np.array([-10.2, -10.0, -9.9])
+    aligned, correction, anchor, final = survey_module._align_state_energies_to_final(
+        raw,
+        "Dispersion correction -0.513591023\n"
+        "FINAL SINGLE POINT ENERGY -10.713591023\n",
+        anchor_roots=(0, 2),
+    )
+
+    assert correction == pytest.approx(-0.513591023)
+    assert anchor == 0
+    assert final == pytest.approx(-10.713591023)
+    assert aligned[2] == pytest.approx(-10.413591023)
+    assert aligned[2] != pytest.approx(final)
 
 
 def test_state_energy_alignment_requires_final_energy():
     with pytest.raises(ORCA6SurveyError, match="FINAL SINGLE POINT ENERGY"):
         survey_module._align_state_energies_to_final(
-            [-10.2, -10.0], "normal output without final energy", anchor_root=1
+            [-10.2, -10.0], "normal output without final energy", anchor_roots=(0, 1)
+        )
+
+
+def test_state_energy_alignment_does_not_guess_an_unprinted_correction():
+    with pytest.raises(ORCA6SurveyError, match="printed no numeric"):
+        survey_module._align_state_energies_to_final(
+            [-10.2, -10.0, -9.9],
+            "FINAL SINGLE POINT ENERGY -10.5\n",
+            anchor_roots=(0, 2),
         )
 
 
@@ -533,6 +561,7 @@ def test_bootstrap_builds_complete_multiplicity_local_snapshot(tmp_path):
     assert snapshot.multiplicities == {1: 3, 2: 3}
     assert snapshot.energies_eh == {1: -10.0, 2: -9.9}
     assert snapshot.metadata["state_independent_energy_correction_eh"] == pytest.approx(0.0)
+    assert snapshot.metadata["energy_anchor_root"] == 2
     assert snapshot.metadata["root_numbering"] == "multiplicity-local-iroot"
     assert set(("cis", "bson", "gbw", "output")) <= set(snapshot.artifacts)
 

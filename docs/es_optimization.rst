@@ -295,13 +295,22 @@ ambiguous.
 
 ORCA's printed TDDFT state table is formed from ``E(SCF)`` plus excitation
 energies, whereas the final ``.engrad`` energy can also contain
-state-independent contributions applied later, such as D3(BJ). Bootstrap
-anchors the selected root to ``FINAL SINGLE POINT ENERGY`` and shifts the whole
-root window by the same amount. Energy-only surveys anchor root zero in the
-same way. Excitation energies are unchanged, while optimizer energies, descent
-checks, and fallback-step ranking remain on one corrected total-energy scale.
-The applied correction and anchor root are recorded in snapshot and survey
-metadata.
+state-independent contributions applied later, such as D3(BJ).  ORCA 6.1.1
+does not use one invariant energy anchor for every TDA/TDDFT EnGrad path: the
+``FINAL SINGLE POINT ENERGY``/``.engrad`` scalar can represent either the
+selected excited state or the reference state even though the reported force
+is for the requested excited root.  Bootstrap therefore parses the printed
+numeric dispersion correction, applies that one common correction to the
+whole root window, and audits whether the final scalar is anchored at root zero
+or the requested root.  Energy-only surveys require a root-zero anchor.
+
+Before a native gradient is returned, its raw scalar must match either the
+audited final anchor or the selected-state energy at that geometry.  The raw
+value is retained as ``orca_engrad_energy``, while the optimizer receives the
+selected-state energy from the complete, same-geometry root survey.  Excitation
+energies are unchanged, and optimizer descent checks and fallback-step ranking
+remain on one corrected excited-state energy scale.  The applied correction,
+final scalar, and anchor root are recorded in snapshot and survey metadata.
 
 When implicit solvent is active, ``CPCMEQ`` must be stated explicitly in the
 ``%tddft``/``%cis`` block. ORCA defaults a vertical energy-only calculation to
