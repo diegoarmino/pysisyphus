@@ -323,6 +323,87 @@ def _tda_hint_from_blocks(blocks: str) -> Optional[bool]:
     return matches[0].lower() in ("true", "1")
 
 
+def _cpcmeq_hint_from_blocks(blocks: str) -> Optional[bool]:
+    """Return the explicit LR-CPCM equilibrium setting from the TDDFT block."""
+
+    excited_blocks = re.findall(
+        r"%(?:tddft|cis)\b.*?\bend\b",
+        str(blocks),
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if len(excited_blocks) != 1:
+        raise ORCA6SurveyError(
+            "Expected exactly one TDDFT/CIS block while checking CPCMEQ."
+        )
+    matches = re.findall(
+        r"\bcpcmeq\s*(?:=\s*)?(true|false|1|0)\b",
+        excited_blocks[0],
+        flags=re.IGNORECASE,
+    )
+    if len(matches) > 1:
+        raise ORCA6SurveyError(
+            "Multiple CPCMEQ directives make the TDDFT/CIS input ambiguous."
+        )
+    if not matches:
+        return None
+    return matches[0].lower() in ("true", "1")
+
+
+def _uses_implicit_solvation(calculator: Any) -> bool:
+    keywords = str(getattr(calculator, "keywords", ""))
+    blocks = str(getattr(calculator, "blocks", ""))
+    if re.search(r"\bnocpcm\b", keywords, flags=re.IGNORECASE):
+        return False
+    return bool(
+        re.search(r"\b(?:cpcm|smd)\b", keywords, flags=re.IGNORECASE)
+        or re.search(r"%cpcm\b", blocks, flags=re.IGNORECASE)
+    )
+
+
+def _require_explicit_cpcmeq(calculator: Any) -> Optional[bool]:
+    """Prevent energy-only surveys and gradients from changing solvent regime."""
+
+    if not _uses_implicit_solvation(calculator):
+        return None
+    cpcmeq = _cpcmeq_hint_from_blocks(getattr(calculator, "blocks", ""))
+    if cpcmeq is None:
+        raise ORCA6SurveyError(
+            "Implicit solvent is active, but the TDDFT/CIS block has no explicit "
+            "CPCMEQ setting. ORCA defaults energy-only surveys to non-equilibrium "
+            "LR-CPCM and analytic gradients to equilibrium LR-CPCM. Add "
+            "'CPCMEQ true' for an equilibrated excited-state optimization (or "
+            "explicitly set false for a deliberately frozen-solvent surface)."
+        )
+    return cpcmeq
+
+
+def _validate_lr_cpcm_regime(output_text: str, expected: Optional[bool]) -> None:
+    """Verify ORCA actually used the requested excited-state solvent regime."""
+
+    if expected is None:
+        return
+    matches = re.findall(
+        r"LR-CPCM\s*\(\s*(non-)?equilibrium\s*\)",
+        output_text,
+        flags=re.IGNORECASE,
+    )
+    regimes = {not bool(prefix) for prefix in matches}
+    if not regimes:
+        raise ORCA6SurveyError(
+            "Implicit solvent is active, but ORCA output does not report an "
+            "LR-CPCM equilibrium/non-equilibrium regime."
+        )
+    if regimes != {bool(expected)}:
+        actual = ", ".join(
+            "equilibrium" if value else "non-equilibrium"
+            for value in sorted(regimes)
+        )
+        wanted = "equilibrium" if expected else "non-equilibrium"
+        raise ORCA6SurveyError(
+            f"ORCA reported LR-CPCM regime(s) {actual}, expected {wanted}."
+        )
+
+
 class ORCA6ArtifactLoader:
     """Load one retained BSON/``.cis`` pair without reading raw GBW bytes."""
 
@@ -793,6 +874,7 @@ def bootstrap_tdentrack_snapshot(
         raise ORCA6SurveyError("Bootstrap calculator has no TDDFT/CIS block.")
     if getattr(calculator, "do_ice", False):
         raise ORCA6SurveyError("ICE-CI cannot bootstrap the ORCA6 TDDFT backend.")
+    cpcmeq = _require_explicit_cpcmeq(calculator)
     if requested_roots is None:
         nroots = getattr(calculator, "nroots", None)
         if nroots is None:
@@ -830,6 +912,7 @@ def bootstrap_tdentrack_snapshot(
         raise ORCA6SurveyError(f"Could not validate ORCA termination: {exc}") from exc
     if not terminated:
         raise ORCA6SurveyError("Bootstrap ORCA output did not terminate normally.")
+    _validate_lr_cpcm_regime(output_text, cpcmeq)
     version_match = re.search(
         r"Program Version\s+([0-9]+(?:\.[0-9]+)+)", output_text
     )
@@ -915,6 +998,7 @@ def bootstrap_tdentrack_snapshot(
             "state_survey_backend": "orca-6.1.1-bson-cis",
             "energy_anchor_root": selected_root,
             "state_independent_energy_correction_eh": energy_correction,
+            "cpcmeq": cpcmeq,
         },
     )
 
@@ -937,6 +1021,7 @@ class ORCA6AllRootSurveyBackend:
         tda: Optional[bool] = None,
     ) -> None:
         self.parent = parent
+        self.cpcmeq = _require_explicit_cpcmeq(parent)
         self.root_numbering = _root_numbering_for(parent)
         self.requested_roots = (
             None if requested_roots is None else tuple(int(root) for root in requested_roots)
@@ -1088,6 +1173,7 @@ class ORCA6AllRootSurveyBackend:
             "root_numbering": self.root_numbering,
             "energy_anchor_root": 0,
             "state_independent_energy_correction_eh": child.energy_correction_eh,
+            "cpcmeq": self.cpcmeq,
         }
         manifest_path = audit_dir / "state_survey.json"
         candidate_artifacts = dict(child.artifacts)
@@ -1173,10 +1259,35 @@ class ORCA6AllRootSurveyBackend:
             "root_numbering": self.root_numbering,
             "energy_anchor_root": 0,
             "state_independent_energy_correction_eh": child.energy_correction_eh,
+            "cpcmeq": self.cpcmeq,
             "atoms": list(atoms),
             "coordinates_bohr": np.asarray(coordinates, dtype=float).reshape(-1).tolist(),
             "reference_roots": list(reference_state.roots),
             "candidate_roots": list(candidate_state.roots),
+            "reference_energies_eh": {
+                str(root): float(value)
+                for root, value in reference.energies_eh.items()
+            },
+            "candidate_energies_eh": {
+                str(root): float(value)
+                for root, value in candidate.energies_eh.items()
+            },
+            "reference_excitation_energies_ev": {
+                str(root): float(value)
+                for root, value in reference.excitation_energies_ev.items()
+            },
+            "candidate_excitation_energies_ev": {
+                str(root): float(value)
+                for root, value in candidate.excitation_energies_ev.items()
+            },
+            "reference_multiplicities": {
+                str(root): int(value)
+                for root, value in reference.multiplicities.items()
+            },
+            "candidate_multiplicities": {
+                str(root): int(value)
+                for root, value in candidate.multiplicities.items()
+            },
             "signed_overlap_matrix": signed.tolist(),
             "reference_self_norms": {str(k): float(v) for k, v in reference_norms.items()},
             "candidate_self_norms": {str(k): float(v) for k, v in candidate_norms.items()},
@@ -1355,6 +1466,7 @@ class ORCA6AllRootSurveyBackend:
             raise ORCA6SurveyError(
                 f"ORCA child output lacks normal termination; audit {audit_dir}."
             )
+        _validate_lr_cpcm_regime(output_text, self.cpcmeq)
         match = re.search(r"Program Version\s+([0-9]+(?:\.[0-9]+)+)", output_text)
         version = None if match is None else match.group(1)
         all_energies = np.asarray(results["all_energies"], dtype=float)

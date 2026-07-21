@@ -28,10 +28,21 @@ class StepControlError(RuntimeError):
 class NoAcceptableStateStep(StepControlError):
     """Raised when none of the surveyed step factors is acceptable."""
 
-    def __init__(self, evaluations: Sequence["TrialEvaluation"]):
+    def __init__(
+        self,
+        evaluations: Sequence["TrialEvaluation"],
+        *,
+        controller_rejections: Optional[Mapping[float, str]] = None,
+    ):
         self.evaluations = tuple(evaluations)
+        self.controller_rejections = dict(controller_rejections or {})
         details = "; ".join(
             f"lambda={trial.factor:g}: {trial.status.value} ({trial.reason})"
+            + (
+                f"; controller rejected: {self.controller_rejections[trial.factor]}"
+                if trial.factor in self.controller_rejections
+                else ""
+            )
             for trial in self.evaluations
         )
         super().__init__(f"No acceptable state-following trial step. {details}")
@@ -197,17 +208,38 @@ class StateAwareStepController:
         self.last_result: Optional[StepControlResult] = None
         self._last_coordinate_tolerance = self.coordinate_tolerance
 
-    def _passes_controller_guards(self, trial: TrialEvaluation, current_energy: Optional[float]) -> bool:
+    def _controller_rejection_reason(
+        self, trial: TrialEvaluation, current_energy: Optional[float]
+    ) -> Optional[str]:
         if not trial.acceptable:
-            return False
+            return "electronic-state decision is not ACCEPT"
         if self.min_score is not None and (trial.score is None or trial.score < self.min_score):
-            return False
+            return (
+                f"similarity {trial.score!r} is below min_score "
+                f"{self.min_score:.12g}"
+            )
         if self.min_margin is not None and (trial.margin is None or trial.margin < self.min_margin):
-            return False
+            return (
+                f"assignment margin {trial.margin!r} is below min_margin "
+                f"{self.min_margin:.12g}"
+            )
         if self.require_descent and current_energy is not None:
-            if trial.energy is None or trial.energy > current_energy + self.energy_tolerance:
-                return False
-        return True
+            if trial.energy is None:
+                return "candidate energy is unavailable for the required descent check"
+            limit = current_energy + self.energy_tolerance
+            if trial.energy > limit:
+                return (
+                    f"candidate energy {trial.energy:.12f} Eh exceeds current "
+                    f"energy {current_energy:.12f} Eh plus tolerance "
+                    f"{self.energy_tolerance:.3e} Eh by "
+                    f"{trial.energy - limit:.6e} Eh"
+                )
+        return None
+
+    def _passes_controller_guards(
+        self, trial: TrialEvaluation, current_energy: Optional[float]
+    ) -> bool:
+        return self._controller_rejection_reason(trial, current_energy) is None
 
     @staticmethod
     def _discard_uncommitted_surveys(calculator: Any) -> None:
@@ -360,7 +392,20 @@ class StateAwareStepController:
         ]
         if not acceptable:
             self._discard_uncommitted_surveys(calculator)
-            raise NoAcceptableStateStep(evaluations)
+            controller_rejections = {
+                trial.factor: reason
+                for trial in evaluations
+                if (
+                    reason := self._controller_rejection_reason(
+                        trial, current_energy
+                    )
+                )
+                is not None
+            }
+            raise NoAcceptableStateStep(
+                evaluations,
+                controller_rejections=controller_rejections,
+            )
 
         selected = min(acceptable, key=self._ranking_key)
         try:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 from pathlib import Path
 import re
 from types import SimpleNamespace
@@ -176,7 +177,16 @@ def test_default_backend_builds_signed_full_matrix_and_audit(tmp_path):
     assert result["candidate"].selected_root is None
     manifest = result["candidate"].artifacts["audit_manifest"]
     assert manifest.is_file()
-    assert "signed_overlap_matrix" in manifest.read_text()
+    manifest_data = json.loads(manifest.read_text())
+    assert "signed_overlap_matrix" in manifest_data
+    assert manifest_data["reference_energies_eh"] == {
+        "1": -10.0,
+        "2": -9.9,
+    }
+    assert manifest_data["candidate_energies_eh"] == {
+        "1": -10.1,
+        "2": -9.8,
+    }
 
 
 def test_signed_contraction_and_self_norms_are_not_absolute():
@@ -412,6 +422,50 @@ def test_tda_hint_rejects_duplicate_directives():
         survey_module._tda_hint_from_blocks("%tddft tda true tda=false end")
 
 
+@pytest.mark.parametrize(
+    "value, expected",
+    (("true", True), ("1", True), ("false", False), ("0", False)),
+)
+def test_cpcmeq_hint_reads_explicit_td_block_setting(value, expected):
+    assert (
+        survey_module._cpcmeq_hint_from_blocks(
+            f"%tddft nroots 3 cpcmeq {value} end"
+        )
+        is expected
+    )
+
+
+def test_implicit_solvent_requires_explicit_cpcmeq():
+    calculator = SimpleNamespace(
+        keywords="UKS CPCM(Acetonitrile)",
+        blocks="%tddft nroots 3 end",
+    )
+    with pytest.raises(ORCA6SurveyError, match="energy-only surveys.*analytic gradients"):
+        survey_module._require_explicit_cpcmeq(calculator)
+
+    calculator.blocks = "%tddft nroots 3 cpcmeq true end"
+    assert survey_module._require_explicit_cpcmeq(calculator) is True
+
+
+def test_nocpcm_does_not_require_cpcmeq():
+    calculator = SimpleNamespace(
+        keywords="UKS NoCPCM",
+        blocks="%tddft nroots 3 end",
+    )
+    assert survey_module._require_explicit_cpcmeq(calculator) is None
+
+
+def test_lr_cpcm_output_regime_must_match_explicit_setting():
+    survey_module._validate_lr_cpcm_regime("LR-CPCM (equilibrium)", True)
+    survey_module._validate_lr_cpcm_regime("LR-CPCM (non-equilibrium)", False)
+    with pytest.raises(ORCA6SurveyError, match="expected equilibrium"):
+        survey_module._validate_lr_cpcm_regime(
+            "LR-CPCM (non-equilibrium)", True
+        )
+    with pytest.raises(ORCA6SurveyError, match="does not report"):
+        survey_module._validate_lr_cpcm_regime("no solvent regime here", True)
+
+
 def test_state_energies_are_shifted_to_selected_engrad_energy():
     raw = np.array([-10.2, -10.0, -9.9])
     aligned, correction = survey_module._align_state_energies_to_final(
@@ -499,6 +553,7 @@ def test_bootstrap_open_shell_uses_global_roots_and_cis_multiplicities(tmp_path)
     artifacts = touch_artifacts(tmp_path, "open_shell_initial")
     artifacts["output"].write_text(
         "Program Version 6.1.1 - RELEASE\n"
+        "LR-CPCM (equilibrium)\n"
         "FINAL SINGLE POINT ENERGY -10.000000000000\n"
         "****ORCA TERMINATED NORMALLY****\n"
     )
@@ -509,6 +564,8 @@ def test_bootstrap_open_shell_uses_global_roots_and_cis_multiplicities(tmp_path)
         triplets = False
         mult = 3
         nroots = 2
+        keywords = "UKS CPCM(Acetonitrile)"
+        blocks = "%tddft nroots 2 cpcmeq true end"
         cis = artifacts["cis"]
         bson = artifacts["bson"]
         gbw = artifacts["gbw"]
@@ -536,3 +593,4 @@ def test_bootstrap_open_shell_uses_global_roots_and_cis_multiplicities(tmp_path)
     assert snapshot.roots == (1, 2)
     assert snapshot.multiplicities == {1: 3, 2: 5}
     assert snapshot.metadata["root_numbering"] == "global-state-iroot"
+    assert snapshot.metadata["cpcmeq"] is True

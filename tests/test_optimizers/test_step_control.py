@@ -154,6 +154,28 @@ def test_no_acceptable_endpoint_is_a_hard_stop():
     assert calc.discard_calls == 1
 
 
+def test_accepted_but_uphill_trials_report_controller_energy_rejection():
+    calc = FakeCalculator(
+        {
+            0.5: ("ACCEPT", 2, -0.97, 0.90, 0.20, "identity passed"),
+            1.0: ("ACCEPT", 2, -0.95, 0.91, 0.21, "identity passed"),
+        }
+    )
+    controller = StateAwareStepController(factors=(0.5, 1.0))
+
+    with pytest.raises(NoAcceptableStateStep) as exc_info:
+        controller.select_step(FakeOptimizer(calc), np.array([1.0, 0.0]))
+
+    message = str(exc_info.value)
+    assert "candidate energy -0.950000000000 Eh" in message
+    assert "current energy -1.000000000000 Eh" in message
+    assert "5.000000e-02 Eh" in message
+    assert set(exc_info.value.controller_rejections) == {0.5, 1.0}
+    assert "5.000000e-02 Eh" in exc_info.value.controller_rejections[1.0]
+    assert "3.000000e-02 Eh" in exc_info.value.controller_rejections[0.5]
+    assert calc.discard_calls == 1
+
+
 def test_detects_survey_that_mutates_committed_revision():
     class MutatingCalculator(FakeCalculator):
         def survey_state(self, atoms, cart_coords, *, factor):

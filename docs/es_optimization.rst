@@ -303,6 +303,16 @@ checks, and fallback-step ranking remain on one corrected total-energy scale.
 The applied correction and anchor root are recorded in snapshot and survey
 metadata.
 
+When implicit solvent is active, ``CPCMEQ`` must be stated explicitly in the
+``%tddft``/``%cis`` block. ORCA defaults a vertical energy-only calculation to
+non-equilibrium LR-CPCM, but switches to equilibrium LR-CPCM when an analytic
+gradient is requested. Since this backend deliberately alternates energy-only
+all-root surveys and selected-root gradients, relying on those job-type
+defaults would compare different excited-state surfaces. The backend therefore
+fails before launching ORCA if CPCM/SMD is active and ``CPCMEQ`` is absent. A
+relaxed excited-state optimization normally uses ``CPCMEQ true``; an explicitly
+frozen-solvent workflow may choose ``false`` as long as every job uses it.
+
 The committed reference must retain readable ``cis`` and ``bson`` artifact
 paths; these paths are serialized in calculator restart data.  The built-in
 backend currently assumes fixed atoms/order, basis, ECPs, multiplicity, and root
