@@ -262,6 +262,14 @@ step-controller mapping. Accepted fallback endpoints are ranked by state
 energy, then overlap score and margin. The controller never commits an
 intermediate geometry along the scaled proposal.
 
+For redundant, DLC, and TRIC optimizations, every surveyed endpoint is obtained
+with a non-mutating iterative backtransformation in the live geometry's current
+internal-coordinate frame.  In particular, TRIC rotations and DLC vectors must
+not be reinitialized in a copied geometry before applying an optimizer step:
+their numerical coordinates would then describe a different frame.  Applying
+an accepted step is checked against the Cartesian endpoint that was actually
+surveyed before its selected-root gradient is authorized.
+
 Post-step reparametrization and optimizer-specific implicit energy probes are
 disabled while transactional control is active. This includes RFO line search,
 GDIIS/GEDIIS, L-BFGS line search/regularization, and SQNM's pre-application and

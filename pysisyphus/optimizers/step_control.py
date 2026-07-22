@@ -325,18 +325,19 @@ class StateAwareStepController:
 
             trial_coords = geometry.coords + trial_step
             try:
-                if getattr(geometry, "coord_type", "cart") == "cart":
-                    cart_coords = geometry.get_temporary_coords(trial_coords)
-                else:
-                    # The normal Geometry.get_temporary_coords() uses a pure,
-                    # linearized backtransform.  State surveys must instead use
-                    # the same iterative internal-to-Cartesian transform that will
-                    # be used when the accepted step is applied.
-                    trial_geometry = geometry.copy()
-                    trial_geometry.coords = trial_coords
-                    cart_coords = trial_geometry.cart_coords.copy()
+                # For internal coordinates this performs the same iterative
+                # backtransformation used when the accepted step is applied,
+                # but ``pure=True`` leaves the live Geometry untouched.  Do not
+                # backtransform through Geometry.copy(): TRIC rotation
+                # primitives and DLC bases are initialized relative to the
+                # copied geometry, so optimizer coordinates from the live
+                # internal basis would be interpreted in a different frame.
+                cart_coords = geometry.get_temporary_coords(trial_coords)
             except Exception as exc:
-                if exc.__class__.__name__ != "RebuiltInternalsException":
+                if exc.__class__.__name__ not in (
+                    "NeedNewInternalsException",
+                    "RebuiltInternalsException",
+                ):
                     self._discard_uncommitted_surveys(calculator)
                     raise
                 evaluations.append(

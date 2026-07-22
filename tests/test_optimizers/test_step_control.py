@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from pysisyphus.Geometry import Geometry
 from pysisyphus.optimizers.step_control import (
     FatalStateSurveyError,
     NoAcceptableStateStep,
@@ -138,6 +139,86 @@ def test_explicit_bridge_policy_can_exceed_optimizer_trust_radius():
     result = controller.select_step(optimizer, np.array([1.0, 0.0]))
 
     assert result.selected.factor == 1.5
+
+
+def test_tric_trial_uses_live_internal_coordinate_frame():
+    """A second TRIC step must not be transformed in a reinitialized copy.
+
+    TRIC rotations are defined relative to their initialization geometry.  A
+    copied Geometry therefore has a different internal-coordinate frame after
+    the first step, even when it contains the same Cartesian coordinates.
+    """
+
+    atoms = ("O", "H", "H", "O", "H", "H")
+    cart_coords = np.array(
+        (
+            0.00, 0.00, 0.00,
+            1.43, 1.10, 0.00,
+            -1.43, 1.10, 0.00,
+            7.00, 0.30, 0.20,
+            8.43, 1.40, 0.20,
+            5.57, 1.40, 0.20,
+        )
+    )
+    geometry = Geometry(atoms, cart_coords, coord_type="tric")
+    rng = np.random.default_rng(12)
+
+    first_step = rng.normal(size=geometry.coords.size)
+    first_step *= 0.08 / np.linalg.norm(first_step)
+    geometry.coords = geometry.coords + first_step
+
+    second_step = rng.normal(size=geometry.coords.size)
+    second_step *= 0.15 / np.linalg.norm(second_step)
+    before_cart = geometry.cart_coords.copy()
+    expected_cart = geometry.get_temporary_coords(geometry.coords + second_step)
+
+    calc = FakeCalculator(
+        {1.0: ("ACCEPT", 2, -1.10, 0.90, 0.20, "clean")}
+    )
+    geometry.set_calculator(calc)
+    optimizer = SimpleNamespace(
+        geometry=geometry,
+        energies=[-1.0],
+        trust_max=1.0,
+    )
+    controller = StateAwareStepController(
+        factors=(1.0,),
+        require_descent=False,
+    )
+
+    result = controller.select_step(optimizer, second_step)
+
+    # Surveying is read-only and uses the current TRIC reference frame.
+    np.testing.assert_allclose(geometry.cart_coords, before_cart, atol=1.0e-12)
+    np.testing.assert_allclose(calc.staged[1], expected_cart, atol=1.0e-12)
+
+    # Applying the selected internal step reaches exactly the surveyed endpoint.
+    geometry.coords = geometry.coords + result.step
+    np.testing.assert_allclose(geometry.cart_coords, expected_cart, atol=1.0e-12)
+    controller.validate_applied_geometry(geometry.cart_coords)
+
+
+def test_pure_backtransform_rebuild_request_marks_trial_for_retry():
+    class NeedNewInternalsException(Exception):
+        pass
+
+    calc = FakeCalculator(
+        {1.0: ("ACCEPT", 2, -1.10, 0.90, 0.20, "unreachable")}
+    )
+    optimizer = FakeOptimizer(calc)
+
+    def require_rebuild(coords):
+        raise NeedNewInternalsException
+
+    optimizer.geometry.get_temporary_coords = require_rebuild
+    controller = StateAwareStepController(factors=(1.0,))
+
+    with pytest.raises(NoAcceptableStateStep) as exc_info:
+        controller.select_step(optimizer, np.array([0.1, 0.0]))
+
+    assert exc_info.value.evaluations[0].status is TrialStatus.RETRY
+    assert "rebuilding internal coordinates" in str(exc_info.value)
+    assert calc.surveyed == []
 
 
 def test_no_acceptable_endpoint_is_a_hard_stop():
