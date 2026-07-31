@@ -273,6 +273,23 @@ the controller then tries another bounded endpoint.  The row choice, global
 choice, pair score, and target-edge stability gap are retained in restart
 history for audit.
 
+Every electronic-state decision also carries a local root-manifold report.
+The reference and candidate neighborhoods are constructed independently from
+same-spin roots using a complete-linkage energy window and are closed through
+the global one-to-one assignment where possible.  Their cross-overlap block is
+Gram-orthonormalized before an SVD, so its singular values are the cosines of
+the principal angles between the transition-density subspaces.  The trial
+history records the manifold roots and dimension, complete singular-value and
+principal-angle spectra, minimum and RMS singular values, maximum principal
+angle, chordal and geodesic distances, energy spans,
+and dimension/assignment-closure flags for every tested factor.
+
+This reporting is audit-only.  An isolated accepted root still supplies the
+only state-specific gradient, while a collectively preserved but individually
+ambiguous manifold remains noncommittable.  Incomplete windows, unequal energy
+neighborhoods, and missing full overlap blocks are represented by explicit
+report statuses instead of silently omitting the diagnostic.
+
 For redundant, DLC, and TRIC optimizations, every surveyed endpoint is obtained
 with a non-mutating iterative backtransformation in the live geometry's current
 internal-coordinate frame.  In particular, TRIC rotations and DLC vectors must

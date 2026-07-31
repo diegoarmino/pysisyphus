@@ -188,6 +188,60 @@ def test_global_assignment_diagnostics_are_serialized_for_restart_audits():
     assert serialized["row_global_agree"] is False
 
 
+def test_root_manifold_diagnostics_are_serialized_for_every_trial():
+    manifold = SimpleNamespace(
+        status=SimpleNamespace(value="ROTATED"),
+        reference_roots=(5, 7),
+        candidate_roots=(7, 5),
+        dimension=2,
+        continuity=SimpleNamespace(
+            singular_values=(0.999, 0.947),
+            principal_angles_rad=(0.04473, 0.32673),
+        ),
+        minimum_singular_value=0.947,
+        rms_singular_value=0.973,
+        maximum_principal_angle_deg=18.72,
+        chordal_distance=0.321,
+        geodesic_distance=0.327,
+        reference_energy_span_ev=0.045,
+        candidate_energy_span_ev=0.062,
+        dimension_match=True,
+        assignment_closed=True,
+        reason="preserved two-root manifold",
+    )
+    result = SimpleNamespace(
+        decision=SimpleNamespace(
+            status="MANIFOLD",
+            selected_root=None,
+            best_score=0.71,
+            margin=0.01,
+            reason="individual roots are ambiguous",
+            manifold_report=manifold,
+        )
+    )
+
+    evaluation = normalize_trial_evaluation(result, 0.75)
+    serialized = evaluation.serializable()
+
+    assert evaluation.manifold_status == "ROTATED"
+    assert evaluation.manifold_reference_roots == (5, 7)
+    assert evaluation.manifold_candidate_roots == (7, 5)
+    assert evaluation.manifold_dimension == 2
+    assert evaluation.manifold_singular_values == pytest.approx((0.999, 0.947))
+    assert evaluation.manifold_principal_angles_deg == pytest.approx(
+        tuple(np.degrees((0.04473, 0.32673)))
+    )
+    assert evaluation.manifold_min_singular_value == pytest.approx(0.947)
+    assert evaluation.manifold_max_angle_deg == pytest.approx(18.72)
+    assert evaluation.manifold_dimension_match is True
+    assert evaluation.manifold_assignment_closed is True
+    assert serialized["manifold_reference_roots"] == [5, 7]
+    assert serialized["manifold_candidate_roots"] == [7, 5]
+    assert serialized["manifold_singular_values"] == pytest.approx([0.999, 0.947])
+    assert serialized["manifold_status"] == "ROTATED"
+    assert serialized["manifold_reason"] == "preserved two-root manifold"
+
+
 def test_explicit_bridge_policy_can_exceed_optimizer_trust_radius():
     calc = FakeCalculator(
         {

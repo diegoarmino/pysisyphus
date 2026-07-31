@@ -79,6 +79,22 @@ class TrialEvaluation:
     global_score: Optional[float] = None
     global_assignment_gap: Optional[float] = None
     row_global_agree: Optional[bool] = None
+    manifold_status: Optional[str] = None
+    manifold_reference_roots: tuple[int, ...] = ()
+    manifold_candidate_roots: tuple[int, ...] = ()
+    manifold_dimension: Optional[int] = None
+    manifold_singular_values: tuple[float, ...] = ()
+    manifold_principal_angles_deg: tuple[float, ...] = ()
+    manifold_min_singular_value: Optional[float] = None
+    manifold_rms_singular_value: Optional[float] = None
+    manifold_max_angle_deg: Optional[float] = None
+    manifold_chordal_distance: Optional[float] = None
+    manifold_geodesic_distance: Optional[float] = None
+    manifold_reference_energy_span_ev: Optional[float] = None
+    manifold_candidate_energy_span_ev: Optional[float] = None
+    manifold_dimension_match: Optional[bool] = None
+    manifold_assignment_closed: Optional[bool] = None
+    manifold_reason: str = ""
     cart_coords: Optional[np.ndarray] = field(default=None, compare=False, repr=False)
     payload: Any = field(default=None, compare=False, repr=False)
 
@@ -100,6 +116,22 @@ class TrialEvaluation:
             "global_score": self.global_score,
             "global_assignment_gap": self.global_assignment_gap,
             "row_global_agree": self.row_global_agree,
+            "manifold_status": self.manifold_status,
+            "manifold_reference_roots": list(self.manifold_reference_roots),
+            "manifold_candidate_roots": list(self.manifold_candidate_roots),
+            "manifold_dimension": self.manifold_dimension,
+            "manifold_singular_values": list(self.manifold_singular_values),
+            "manifold_principal_angles_deg": list(self.manifold_principal_angles_deg),
+            "manifold_min_singular_value": self.manifold_min_singular_value,
+            "manifold_rms_singular_value": self.manifold_rms_singular_value,
+            "manifold_max_angle_deg": self.manifold_max_angle_deg,
+            "manifold_chordal_distance": self.manifold_chordal_distance,
+            "manifold_geodesic_distance": self.manifold_geodesic_distance,
+            "manifold_reference_energy_span_ev": self.manifold_reference_energy_span_ev,
+            "manifold_candidate_energy_span_ev": self.manifold_candidate_energy_span_ev,
+            "manifold_dimension_match": self.manifold_dimension_match,
+            "manifold_assignment_closed": self.manifold_assignment_closed,
+            "manifold_reason": self.manifold_reason,
         }
 
 
@@ -159,6 +191,37 @@ def normalize_trial_evaluation(result: Any, factor: float) -> TrialEvaluation:
     global_score = _field(assignment, "target_pair_score")
     global_assignment_gap = _field(assignment, "target_edge_stability_gap")
     row_global_agree = _field(assignment, "row_global_agree")
+    manifold = _field(source, "manifold_report")
+    manifold_status = _field(manifold, "status")
+    manifold_status = _field(manifold_status, "value", manifold_status)
+    manifold_reference_roots = tuple(
+        int(root) for root in (_field(manifold, "reference_roots", ()) or ())
+    )
+    manifold_candidate_roots = tuple(
+        int(root) for root in (_field(manifold, "candidate_roots", ()) or ())
+    )
+    continuity = _field(manifold, "continuity")
+    raw_singular_values = _field(continuity, "singular_values", ())
+    raw_principal_angles = _field(continuity, "principal_angles_rad", ())
+    if raw_singular_values is None:
+        raw_singular_values = ()
+    if raw_principal_angles is None:
+        raw_principal_angles = ()
+    manifold_singular_values = tuple(
+        float(value) for value in raw_singular_values
+    )
+    manifold_principal_angles_deg = tuple(
+        float(np.degrees(value))
+        for value in raw_principal_angles
+    )
+
+    def optional_float(name: str) -> Optional[float]:
+        value = _field(manifold, name)
+        return None if value is None else float(value)
+
+    def optional_bool(name: str) -> Optional[bool]:
+        value = _field(manifold, name)
+        return None if value is None else bool(value)
 
     return TrialEvaluation(
         factor=float(factor),
@@ -179,6 +242,30 @@ def normalize_trial_evaluation(result: Any, factor: float) -> TrialEvaluation:
         row_global_agree=(
             None if row_global_agree is None else bool(row_global_agree)
         ),
+        manifold_status=None if manifold_status is None else str(manifold_status),
+        manifold_reference_roots=manifold_reference_roots,
+        manifold_candidate_roots=manifold_candidate_roots,
+        manifold_dimension=(
+            None
+            if _field(manifold, "dimension") is None
+            else int(_field(manifold, "dimension"))
+        ),
+        manifold_singular_values=manifold_singular_values,
+        manifold_principal_angles_deg=manifold_principal_angles_deg,
+        manifold_min_singular_value=optional_float("minimum_singular_value"),
+        manifold_rms_singular_value=optional_float("rms_singular_value"),
+        manifold_max_angle_deg=optional_float("maximum_principal_angle_deg"),
+        manifold_chordal_distance=optional_float("chordal_distance"),
+        manifold_geodesic_distance=optional_float("geodesic_distance"),
+        manifold_reference_energy_span_ev=optional_float(
+            "reference_energy_span_ev"
+        ),
+        manifold_candidate_energy_span_ev=optional_float(
+            "candidate_energy_span_ev"
+        ),
+        manifold_dimension_match=optional_bool("dimension_match"),
+        manifold_assignment_closed=optional_bool("assignment_closed"),
+        manifold_reason=str(_field(manifold, "reason", "") or ""),
         payload=result,
     )
 
