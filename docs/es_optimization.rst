@@ -264,6 +264,15 @@ proposal. State energy is the final tiebreaker; the independently configured
 descent guard still rejects uphill endpoints. The controller never commits an
 intermediate geometry along the scaled proposal.
 
+When a calculator supplies a complete signed root-overlap block, TDenTrack also
+solves a multiplicity-compatible global one-to-one assignment.  The default
+``guard`` policy requires the followed row's preferred root to agree with a
+stable global assignment.  A disagreement or a nearly degenerate alternative
+assignment remains noncommittable and is reported as ``RETRY`` or ``MANIFOLD``;
+the controller then tries another bounded endpoint.  The row choice, global
+choice, pair score, and target-edge stability gap are retained in restart
+history for audit.
+
 For redundant, DLC, and TRIC optimizations, every surveyed endpoint is obtained
 with a non-mutating iterative backtransformation in the live geometry's current
 internal-coordinate frame.  In particular, TRIC rotations and DLC vectors must

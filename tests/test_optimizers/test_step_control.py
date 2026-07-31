@@ -11,6 +11,7 @@ from pysisyphus.optimizers.step_control import (
     StateAwareStepController,
     TrialStatus,
     make_step_controller,
+    normalize_trial_evaluation,
 )
 
 
@@ -153,6 +154,38 @@ def test_root8_regression_prefers_clean_half_step_over_lower_energy_bridge():
     assert result.selected.root == 8
     assert result.selected.score == pytest.approx(0.935142)
     np.testing.assert_allclose(result.step, [0.5, 0.0])
+
+
+def test_global_assignment_diagnostics_are_serialized_for_restart_audits():
+    assignment = SimpleNamespace(
+        row_best_candidate_root=5,
+        target_candidate_root=7,
+        target_pair_score=0.534678796,
+        target_edge_stability_gap=0.009215957,
+        row_global_agree=False,
+    )
+    result = SimpleNamespace(
+        decision=SimpleNamespace(
+            status="RETRY",
+            selected_root=None,
+            selected_energy_eh=-1222.972901173,
+            best_score=0.654836563,
+            margin=0.120157767,
+            reason="row/global disagreement",
+            global_assignment=assignment,
+        )
+    )
+
+    evaluation = normalize_trial_evaluation(result, 1.0)
+    serialized = evaluation.serializable()
+
+    assert evaluation.row_best_root == 5
+    assert evaluation.global_root == 7
+    assert evaluation.global_score == pytest.approx(0.534678796)
+    assert evaluation.global_assignment_gap == pytest.approx(0.009215957)
+    assert evaluation.row_global_agree is False
+    assert serialized["global_root"] == 7
+    assert serialized["row_global_agree"] is False
 
 
 def test_explicit_bridge_policy_can_exceed_optimizer_trust_radius():

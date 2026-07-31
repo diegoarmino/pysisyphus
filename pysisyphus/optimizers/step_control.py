@@ -74,6 +74,11 @@ class TrialEvaluation:
     margin: Optional[float] = None
     root: Optional[int] = None
     reason: str = ""
+    row_best_root: Optional[int] = None
+    global_root: Optional[int] = None
+    global_score: Optional[float] = None
+    global_assignment_gap: Optional[float] = None
+    row_global_agree: Optional[bool] = None
     cart_coords: Optional[np.ndarray] = field(default=None, compare=False, repr=False)
     payload: Any = field(default=None, compare=False, repr=False)
 
@@ -90,6 +95,11 @@ class TrialEvaluation:
             "margin": self.margin,
             "root": self.root,
             "reason": self.reason,
+            "row_best_root": self.row_best_root,
+            "global_root": self.global_root,
+            "global_score": self.global_score,
+            "global_assignment_gap": self.global_assignment_gap,
+            "row_global_agree": self.row_global_agree,
         }
 
 
@@ -143,6 +153,12 @@ def normalize_trial_evaluation(result: Any, factor: float) -> TrialEvaluation:
     score = _field(source, "score", _field(source, "best_score"))
     margin = _field(source, "margin")
     reason = str(_field(source, "reason", ""))
+    assignment = _field(source, "global_assignment")
+    row_best_root = _field(assignment, "row_best_candidate_root")
+    global_root = _field(assignment, "target_candidate_root")
+    global_score = _field(assignment, "target_pair_score")
+    global_assignment_gap = _field(assignment, "target_edge_stability_gap")
+    row_global_agree = _field(assignment, "row_global_agree")
 
     return TrialEvaluation(
         factor=float(factor),
@@ -152,6 +168,17 @@ def normalize_trial_evaluation(result: Any, factor: float) -> TrialEvaluation:
         margin=None if margin is None else float(margin),
         root=None if selected_root is None else int(selected_root),
         reason=reason,
+        row_best_root=None if row_best_root is None else int(row_best_root),
+        global_root=None if global_root is None else int(global_root),
+        global_score=None if global_score is None else float(global_score),
+        global_assignment_gap=(
+            None
+            if global_assignment_gap is None
+            else float(global_assignment_gap)
+        ),
+        row_global_agree=(
+            None if row_global_agree is None else bool(row_global_agree)
+        ),
         payload=result,
     )
 
