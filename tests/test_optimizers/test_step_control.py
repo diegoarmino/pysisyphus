@@ -102,7 +102,7 @@ def test_identity_guards_precede_energy_ranking():
     assert calc.surveyed == [1.0]
 
 
-def test_exhaustive_mode_can_rank_all_clean_endpoints_by_energy():
+def test_exhaustive_mode_prefers_stronger_identity_over_lower_energy():
     calc = FakeCalculator(
         {
             1.0: ("ACCEPT", 2, -1.10, 0.90, 0.20, "clean"),
@@ -118,7 +118,41 @@ def test_exhaustive_mode_can_rank_all_clean_endpoints_by_energy():
     )
 
     assert calc.surveyed == [1.0, 1.5]
-    assert result.selected.factor == 1.5
+    assert result.selected.factor == 1.0
+
+
+def test_root8_regression_prefers_clean_half_step_over_lower_energy_bridge():
+    """Reproduce the first state-8 proposal from the Ru optimization.
+
+    The unscaled proposal was ambiguous.  Of the accepted fallbacks, lambda
+    0.5 retained root 8 with much stronger similarity and margin, whereas the
+    former energy-first policy selected the lower-energy lambda-1.5/root-5
+    endpoint.
+    """
+
+    calc = FakeCalculator(
+        {
+            1.0: ("RETRY", 7, -1222.967519938, 0.590254, 0.037487, "ambiguous"),
+            0.5: ("ACCEPT", 8, -1222.964315780, 0.935142, 0.646000, "clean"),
+            0.75: ("ACCEPT", 8, -1222.964745675, 0.747799, 0.182961, "clean"),
+            1.25: ("ACCEPT", 6, -1222.967807311, 0.692288, 0.240620, "clean"),
+            1.5: ("ACCEPT", 5, -1222.968159327, 0.719634, 0.209542, "clean"),
+        }
+    )
+    optimizer = FakeOptimizer(calc)
+    optimizer.energies = [-1222.960691738]
+    controller = StateAwareStepController(
+        factors=(0.5, 0.75, 1.0, 1.25, 1.5),
+        fallback_only=True,
+    )
+
+    result = controller.select_step(optimizer, np.array([1.0, 0.0]))
+
+    assert calc.surveyed == [1.0, 0.5, 0.75, 1.25, 1.5]
+    assert result.selected.factor == 0.5
+    assert result.selected.root == 8
+    assert result.selected.score == pytest.approx(0.935142)
+    np.testing.assert_allclose(result.step, [0.5, 0.0])
 
 
 def test_explicit_bridge_policy_can_exceed_optimizer_trust_radius():

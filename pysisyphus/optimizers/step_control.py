@@ -257,13 +257,16 @@ class StateAwareStepController:
 
     @staticmethod
     def _ranking_key(trial: TrialEvaluation) -> tuple[float, float, float, float]:
-        # Identity has already been certified by ACCEPT. Prefer the lowest
-        # endpoint energy, then the strongest score/margin, then lambda nearest
-        # to the optimizer's original proposal.
-        energy = math.inf if trial.energy is None else trial.energy
+        # ACCEPT only certifies that a trial clears the minimum electronic
+        # thresholds.  Several accepted endpoints can still differ greatly in
+        # how well they preserve the committed state.  Rank by electronic
+        # identity first; use endpoint energy only to break an otherwise exact
+        # identity/step-scale tie.  Descent remains an independent controller
+        # guard in _controller_rejection_reason().
         score = -math.inf if trial.score is None else trial.score
         margin = -math.inf if trial.margin is None else trial.margin
-        return (energy, -score, -margin, abs(trial.factor - 1.0))
+        energy = math.inf if trial.energy is None else trial.energy
+        return (-score, -margin, abs(trial.factor - 1.0), energy)
 
     def select_step(self, optimizer: Any, step: np.ndarray) -> StepControlResult:
         step = np.asarray(step, dtype=float)
@@ -369,8 +372,8 @@ class StateAwareStepController:
             # In the common case the optimizer's own proposal already has a
             # unique, descending electronic identity.  Avoid launching every
             # fallback TDDFT job unless the primary endpoint actually needs an
-            # alternative.  ``fallback_only=False`` retains exhaustive energy
-            # ranking for workflows that explicitly want it.
+            # alternative.  ``fallback_only=False`` retains exhaustive
+            # identity-first ranking for workflows that explicitly want it.
             if (
                 self.fallback_only
                 and factor == self.primary_factor

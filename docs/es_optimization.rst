@@ -258,8 +258,10 @@ The normal RFO proposal remains inside its current trust radius. Factors above
 one may bridge a narrow mixed region up to ``trust_max``. Going beyond that
 global maximum is deliberately a separate opt-in: set
 ``respect_trust_max=False`` *and* provide a finite ``max_step_norm`` in the
-step-controller mapping. Accepted fallback endpoints are ranked by state
-energy, then overlap score and margin. The controller never commits an
+step-controller mapping. Accepted fallback endpoints are ranked by overlap
+score, then assignment margin and proximity to the optimizer's original
+proposal. State energy is the final tiebreaker; the independently configured
+descent guard still rejects uphill endpoints. The controller never commits an
 intermediate geometry along the scaled proposal.
 
 For redundant, DLC, and TRIC optimizations, every surveyed endpoint is obtained
