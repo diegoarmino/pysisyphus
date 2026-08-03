@@ -305,6 +305,13 @@ line search. Their unsurveyed geometries would otherwise precede the
 transaction boundary. A converged current geometry is detected before any new
 all-root survey is launched.
 
+If an optimization stops after a trial endpoint was staged but before its
+selected-root gradient commits, the optimizer restores both the previous
+coordinates and their cached energy/Cartesian forces. Coordinate rollback by
+itself invalidates ``Geometry``'s cache; restoring the evaluated results as one
+transaction prevents final reporting or restart preparation from launching a
+duplicate ORCA gradient at the already evaluated geometry.
+
 Root numbering follows the reference type.  Closed-shell spin-adapted triplets
 use **multiplicity-local ordinals** ``1..N``; root ``k`` maps to triplet
 ``IRoot k`` and ``IRootMult triplet``.  Unrestricted open-shell references use

@@ -332,6 +332,7 @@ class Optimizer(metaclass=abc.ABCMeta):
         self._state_step_transaction_open = False
         self._state_step_rollback_coords = None
         self._state_step_rollback_cart_coords = None
+        self._state_step_rollback_results = None
         self._state_step_tracking_revision = None
         self.logging_level = logging_level
 
@@ -464,6 +465,17 @@ class Optimizer(metaclass=abc.ABCMeta):
         rollback_cart_coords = np.asarray(
             self.geometry.cart_coords, dtype=float
         ).copy()
+        # Changing coordinates clears Geometry's electronic cache.  Preserve
+        # the last evaluated energy and Cartesian forces so that an operator
+        # stop, cycle limit, or later optimizer exception can roll back without
+        # launching a duplicate selected-root gradient at the old geometry.
+        rollback_results = {}
+        if bool(getattr(self.geometry, "has_energy", False)):
+            rollback_results["energy"] = float(self.geometry.energy)
+        if bool(getattr(self.geometry, "has_forces", False)):
+            rollback_results["forces"] = np.asarray(
+                self.geometry.cart_forces, dtype=float
+            ).copy()
         try:
             result = self.step_controller.select_step(self, original)
         except BaseException:
@@ -475,6 +487,7 @@ class Optimizer(metaclass=abc.ABCMeta):
         self._state_step_transaction_open = True
         self._state_step_rollback_coords = rollback_coords
         self._state_step_rollback_cart_coords = rollback_cart_coords
+        self._state_step_rollback_results = rollback_results or None
         self._state_step_tracking_revision = getattr(
             self.geometry.calculator, "tracking_revision", None
         )
@@ -555,6 +568,7 @@ class Optimizer(metaclass=abc.ABCMeta):
             self._state_step_transaction_open = False
             self._state_step_rollback_coords = None
             self._state_step_rollback_cart_coords = None
+            self._state_step_rollback_results = None
             self._state_step_tracking_revision = None
             self.log(
                 "The electronic state step was already committed; retaining its "
@@ -577,9 +591,21 @@ class Optimizer(metaclass=abc.ABCMeta):
             # Compatibility fallback for custom controllers/optimizers that
             # staged state before the explicit transaction marker existed.
             self.geometry.coords = np.asarray(self.coords[-1], dtype=float).copy()
+        rollback_results = getattr(self, "_state_step_rollback_results", None)
+        if rollback_results:
+            set_results = getattr(self.geometry, "set_results", None)
+            if callable(set_results):
+                restored = {
+                    key: np.asarray(value, dtype=float).copy()
+                    if key == "forces"
+                    else value
+                    for key, value in rollback_results.items()
+                }
+                set_results(restored)
         self._state_step_transaction_open = False
         self._state_step_rollback_coords = None
         self._state_step_rollback_cart_coords = None
+        self._state_step_rollback_results = None
         self._state_step_tracking_revision = None
         self.log(
             "Discarded the unevaluated staged state endpoint and restored the "
@@ -613,6 +639,7 @@ class Optimizer(metaclass=abc.ABCMeta):
         self._state_step_transaction_open = False
         self._state_step_rollback_coords = None
         self._state_step_rollback_cart_coords = None
+        self._state_step_rollback_results = None
         self._state_step_tracking_revision = None
 
     def get_path_for_fn(self, fn, with_prefix=True):
